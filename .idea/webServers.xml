@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="69697424-0e14-47c2-b975-c1994ef67319" name="root@192.168.29.220:20022 password">
+        <fileTransfer accessType="SFTP" host="192.168.29.220" port="20022" sshConfigId="6dc59200-76da-47d1-aaf3-3c7444954612" sshConfig="root@192.168.29.220:20022 password">
+          <advancedOptions>
+            <advancedOptions connections="2" />
+          </advancedOptions>
+        </fileTransfer>
+        <option name="numberOfConnections" value="2" />
+      </webServer>
+    </option>
+  </component>
+</project>
