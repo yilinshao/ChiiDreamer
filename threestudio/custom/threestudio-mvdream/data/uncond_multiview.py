@@ -82,11 +82,7 @@ class RandomMultiviewCameraIterableDataset(RandomCameraIterableDataset):
         azimuth_deg = (
             torch.rand(real_batch_size).reshape(-1, 1)
             + torch.arange(self.cfg.n_view).reshape(1, -1)
-        ).reshape(-1) / self.cfg.n_view * (
-            self.azimuth_range[1] - self.azimuth_range[0]
-        ) + self.azimuth_range[
-            0
-        ]
+        ).reshape(-1) / self.cfg.n_view * (self.azimuth_range[1] - self.azimuth_range[0]) + self.azimuth_range[0]
         azimuth = azimuth_deg * math.pi / 180
 
         ######## Different from original ########
@@ -103,6 +99,7 @@ class RandomMultiviewCameraIterableDataset(RandomCameraIterableDataset):
             * (self.camera_distance_range[1] - self.camera_distance_range[0])
             + self.camera_distance_range[0]
         ).repeat_interleave(self.cfg.n_view, dim=0)
+        # NOTE: relative_radius 表示
         if self.cfg.relative_radius:
             scale = 1 / torch.tan(0.5 * fovy)
             camera_distances = scale * camera_distances
@@ -127,6 +124,8 @@ class RandomMultiviewCameraIterableDataset(RandomCameraIterableDataset):
             ],
             dim=-1,
         )
+
+        # NOTE: 世界坐标系中camera的位置
 
         # default scene center at origin
         center: Float[Tensor, "B 3"] = torch.zeros_like(camera_positions)

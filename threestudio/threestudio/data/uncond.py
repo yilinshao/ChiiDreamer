@@ -90,10 +90,17 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
             assert len(self.heights) == len(self.cfg.resolution_milestones) + 1
             self.resolution_milestones = [-1] + self.cfg.resolution_milestones
 
+        # NOTE: resolution_milestones 是改变分辨率的,
+        #  如果 len(heights 和 weights) > 1, 那么会在 iteration=resolution_milestone 时改变分辨率.
+        #  (但是这里并不起作用, threestudio 只是留了这个代码, 可能为了日后升级)
+
         self.directions_unit_focals = [
             get_ray_directions(H=height, W=width, focal=1.0)
             for (height, width) in zip(self.heights, self.widths)
         ]
+
+        # NOTE: 相机坐标系中, focal = 1.0 时每个像素点的direction
+
         self.height: int = self.heights[0]
         self.width: int = self.widths[0]
         self.batch_size: int = self.batch_sizes[0]
