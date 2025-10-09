@@ -1,16 +1,16 @@
-
 import time
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from np_utils.dataset import Dataset
-from np_utils.utils import CAPUDFNetwork
+print(__name__)
+from .dataset import Dataset
+from .utils import CAPUDFNetwork
 import argparse
 import os
 from shutil import copyfile
 import numpy as np
 import trimesh
-from np_utils.extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
+from .extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 import math
 from pytorch3d.ops import knn_points
 from scipy.spatial import cKDTree
@@ -65,7 +65,7 @@ class Runner:
 
 
     def get_learning_rate_at_iteration(self, iter_step, max_iter=60050):
-        warn_up = 1000
+        warn_up = 100
         init_lr = 0.001
         lr = (iter_step / warn_up) if iter_step < warn_up else 0.5 * (
                 math.cos((iter_step - warn_up) / (max_iter - warn_up) * math.pi) + 1)

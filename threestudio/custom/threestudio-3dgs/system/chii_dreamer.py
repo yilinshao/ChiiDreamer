@@ -4,6 +4,7 @@ import numpy as np
 import random
 import threestudio
 import torch
+import pytorch_lightning
 from threestudio.systems.base import BaseLift3DSystem
 from threestudio.systems.utils import parse_optimizer, parse_scheduler
 from threestudio.utils.loss import tv_loss
@@ -23,7 +24,17 @@ from threestudio.utils.ops import (
     get_rays,
 )
 from torch_kdtree import build_kd_tree
+
 from ..utils.np_utils.train import Runner
+from ..geometry.gaussian_base import BasicPointCloud
+from pytorch3d.ops import knn_points
+from ..utils.sugar_utils.spherical_harmonics import SH2RGB
+
+from ..sugar_scene.sugar_model import SuGaR
+from ..sugar_scene.gs_model import PseudoGaussianSplattingWrapper
+from ..sugar_scene.sugar_optimizer import OptimizationParams, SuGaROptimizer
+from ..sugar_scene.sugar_densifier import SuGaRDensifier
+from ..utils.sugar_utils.loss_utils import l1_loss, ssim
 
 # from ..geometry.gaussian_base import BasicPointCloud
 
@@ -32,7 +43,7 @@ Here we assume the given condition are 2D layout boxes, and given in the CONFIG 
 Also we here apply the transformation for initialized 3D layout in this file for better explanability.
 After initialization, the initialized 3D boxes are then transformed into optimizable parameters that controls the relative positions of given box.
 NOTE@: Now we only consider depth and rotation as differentiable parameters that could be optimized.
-TODO@: Implementing loading Layouy 2D boxes and then transform into 3D boxes.
+TODO@: Implementing loading Layout 2D boxes and then transform into 3D boxes.
         CUSTOMIZED PARAMETERS:
         self.geometry.layout_2d: numpy->ndarray, the user given 2D layout boxes.
         self.geometry.box_configs: initialized 3D layout box.
@@ -41,39 +52,88 @@ TODO@: Implementing loading Layouy 2D boxes and then transform into 3D boxes.
 HERE WE MENTION THAT: at the end of each iteration, we should update the given xyz.
 '''
 
+
 @threestudio.register("gaussian-splatting-chiidreamer-system")
-class LayoutGSSystem(BaseLift3DSystem):
+class LayoutCHIGSSystem(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         visualize_samples: bool = False
+        gaussian_checkpoint: str = None
+        start_sdf_regularization_from: int = 9000
+        reset_neighbors_every: int = 500
+        start_reset_neighbors_from: int = 7000
 
     cfg: Config
 
     def configure(self) -> None:
         # set up geometry, material, background, renderer
-        # self.pre_process_instances()
         super().configure()
 
-        # ===========================================syl----------------
-        # 1. initialize SuGaR from 3dgs
+        self.automatic_optimization = False
+        # self.lpips = LPIPS(net='vgg').to(self.device)
+        self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
+
+        # split the prompt into list
+        split_prompt = False
+        prompt_str = self.cfg.prompt_processor.prompt
+        if '.' in prompt_str:
+            prompt_list = [p.strip() for p in prompt_str.split('.')]
+            split_prompt = True
+
+        self.prompt_processor_list = []
+        self.prompt_utils_list = []
+        if split_prompt:
+            for prompt_item in prompt_list:
+                self.cfg.prompt_processor['prompt'] = prompt_item
+                prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(self.cfg.prompt_processor)
+                prompt_utils = prompt_processor()
+
+                self.prompt_processor_list.append(prompt_processor)
+                self.prompt_utils_list.append(prompt_utils)
+        else:
+            self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
+                self.cfg.prompt_processor
+            )
+            self.prompt_utils = self.prompt_processor()
+
+        # init chiidreamer, first, load from gaussian checkpoint
+        assert self.cfg.gaussian_checkpoint is not None
+        self.load_gaussian_checkpoint(self.cfg.gaussian_checkpoint)
+
+        # get random number generation and recover it after initialization, to maintain dataset loading order
+        rng_state = torch.get_rng_state()
+
+        # get position and color from trained 3DGS
         with torch.no_grad():
             print("Initializing model from trained 3DGS...")
-            # sh_levels = int(np.sqrt(nerfmodel.gaussians.get_features.shape[1]))
-
-            from ..utils.sugar_utils.spherical_harmonics import SH2RGB
+            sh_levels = int(np.sqrt(self.geometry.get_features.shape[1]))
             points = self.geometry.get_xyz.detach().float().cuda()
             colors = SH2RGB(self.geometry.get_features[:, 0].detach().float().cuda())
-            n_points = len(points)
         print(f"Point cloud generated. Number of points: {len(points)}")
 
-        # Construct SuGaR model
-        scene_name = args.output_dir.split('/')[-1]
+        # param setting
+        learnable_positions = True
+        triangle_scale = 1.
+        regularity_knn = 16  # 8 until now
+        beta_mode = None
+        freeze_gaussians = False
+        o3d_mesh = None
+        learn_surface_mesh_positions = False
+        learn_surface_mesh_opacity = False
+        learn_surface_mesh_scales = False
+        n_gaussians_per_surface_triangle = 1
+        nerfmodel = PseudoGaussianSplattingWrapper(
+            device=self.geometry.device,
+            height=512,
+            width=512,
+            cam_radius=1.732,
+            gaussian_model=self.geometry)
 
-        from ..sugar_scene.sugar_model import SuGaR
-        sugar = SuGaR(
+        # init SuGaR model
+        self.sugar = SuGaR(
             nerfmodel=nerfmodel,
-            points=points,  # nerfmodel.gaussians.get_xyz.data,
-            colors=colors,  # 0.5 + _C0 * nerfmodel.gaussians.get_features.data[:, 0, :],
+            points=points,
+            colors=colors,
             initialize=True,
             sh_levels=sh_levels,
             learnable_positions=learnable_positions,
@@ -89,82 +149,85 @@ class LayoutGSSystem(BaseLift3DSystem):
             learn_surface_mesh_scales=learn_surface_mesh_scales,
             n_gaussians_per_surface_triangle=n_gaussians_per_surface_triangle,
         )
-        if initialize_from_trained_3dgs:
-            with torch.no_grad():
-                CONSOLE.print("Initializing 3D gaussians from 3D gaussians...")
-                if prune_at_start:
-                    sugar._scales[...] = nerfmodel.gaussians._scaling.detach()[start_prune_mask]
-                    sugar._quaternions[...] = nerfmodel.gaussians._rotation.detach()[start_prune_mask]
-                    sugar.all_densities[...] = nerfmodel.gaussians._opacity.detach()[start_prune_mask]
-                    sugar._sh_coordinates_dc[...] = nerfmodel.gaussians._features_dc.detach()[start_prune_mask]
-                    sugar._sh_coordinates_rest[...] = nerfmodel.gaussians._features_rest.detach()[start_prune_mask]
-                else:
-                    sugar._scales[...] = nerfmodel.gaussians._scaling.detach()
-                    sugar._quaternions[...] = nerfmodel.gaussians._rotation.detach()
-                    sugar.all_densities[...] = nerfmodel.gaussians._opacity.detach()
-                    sugar._sh_coordinates_dc[...] = nerfmodel.gaussians._features_dc.detach()
-                    sugar._sh_coordinates_rest[...] = nerfmodel.gaussians._features_rest.detach()
 
+        # init the rest 3DGS param
+        with torch.no_grad():
+            print("Initializing 3D gaussians from pre-trained 3D gaussians...")
+            self.sugar._scales[...] = self.geometry._scaling.detach()
+            self.sugar._quaternions[...] = self.geometry._rotation.detach()
+            self.sugar.all_densities[...] = self.geometry._opacity.detach()
+            self.sugar._sh_coordinates_dc[...] = self.geometry._features_dc.detach()
+            self.sugar._sh_coordinates_rest[...] = self.geometry._features_rest.detach()
 
+        # init SDF
+        self.sugar.part_num = 1
+        sugar_checkpoint_path = '.'  # fixme: redundant, checkpoint will not be set here
+        self.sugar.neus = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
+        # TODO: for objects_i in range(len(self.prompt_processor_list) - 2):
+        self.sugar.sdf_0 = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
 
+        print(f'\nSuGaR model has been initialized.')
+        print(f'Number of parameters: {sum(p.numel() for p in self.sugar.parameters() if p.requires_grad)}')
+        print(f'Checkpoints will be saved in {sugar_checkpoint_path}')
+        print("\nModel parameters:")
+        for name, param in self.sugar.named_parameters():
+            print(name, param.shape, param.requires_grad)
 
-        self.automatic_optimization = False
-        # self.lpips = LPIPS(net='vgg').to(self.device)
-        self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
+        cameras_spatial_extent = self.sugar.get_cameras_spatial_extent()
 
-        # syl================== split the prompt into list======
-        self.split_prompt = False
-        prompt_str = self.cfg.prompt_processor.prompt
-        if '.' in prompt_str:
-            prompt_list = [p.strip() for p in prompt_str.split ('.')]
-            self.split_prompt = True
+        # ====================Initialize optimizer====================
+        spatial_lr_scale = cameras_spatial_extent
+        print("Using camera spatial extent as spatial_lr_scale:", spatial_lr_scale)
+        position_lr_init = 0.000016
+        position_lr_final = 0.0000016
+        position_lr_delay_mult = 0.01
+        position_lr_max_steps = 1600
+        feature_lr = 0.0025
+        opacity_lr = 0.05
+        scaling_lr = 0.0005
+        rotation_lr = 0.001
 
-        self.prompt_processor_list = []
-        self.prompt_utils_list = []
-        if self.split_prompt:
-            for prompt_item in prompt_list:
-                self.cfg.prompt_processor['prompt'] = prompt_item
-                prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(self.cfg.prompt_processor)
-                prompt_utils = prompt_processor()
+        opt_params = OptimizationParams(
+            position_lr_init=position_lr_init,
+            position_lr_final=position_lr_final,
+            position_lr_delay_mult=position_lr_delay_mult,
+            position_lr_max_steps=position_lr_max_steps,
+            feature_lr=feature_lr,
+            opacity_lr=opacity_lr,
+            scaling_lr=scaling_lr,
+            rotation_lr=rotation_lr,
+        )
+        self.sugar_optimizer = SuGaROptimizer(self.sugar, opt_params, spatial_lr_scale=spatial_lr_scale)
 
-                self.prompt_processor_list.append(prompt_processor)
-                self.prompt_utils_list.append(prompt_utils)
-        else:
-            self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
-                self.cfg.prompt_processor
-            )
-            self.prompt_utils = self.prompt_processor()
+        print("Optimizer initialized.")
+        print("Optimizable parameters:")
+        for param_group in self.sugar_optimizer.optimizer.param_groups:
+            print(param_group['name'], param_group['lr'])
 
-        #  edited by colez
+        # ====================Initialize densifier====================
+        # do not use the densifier
+        densify_grad_threshold = 0.0001  # 0.0002
+        densify_screen_size_threshold = 20
+        prune_opacity_threshold = 0.005
+        densification_percent_distinction = 0.01
+        self.gaussian_densifier = SuGaRDensifier(
+            sugar_model=self.sugar,
+            sugar_optimizer=self.sugar_optimizer,
+            max_grad=densify_grad_threshold,
+            min_opacity=prune_opacity_threshold,
+            max_screen_size=densify_screen_size_threshold,
+            scene_extent=cameras_spatial_extent,
+            percent_dense=densification_percent_distinction,
+        )
+        print("Densifier initialized.")
 
-        if self.cfg.loss['lambda_feat_recon_loss'] > 0.0 and self.geometry.cfg.optimize_layout:
-            self.processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-            self.feat_model = AutoModel.from_pretrained("facebook/dinov2-base").to('cuda')
-            # frontal view batch preparation
-            self.frontal_batch = self.get_frontal_camera_batch()
-            # Prepare embedding
-            image_ref = Image.open(f'../MIGC/layout2image/{os.path.basename(self.geometry.cfg.geometry_convert_from)}/foreground_composed.jpg')
-            inputs1 = self.processor(images=image_ref, return_tensors="pt").to('cuda')
-            outputs1 = self.feat_model(**inputs1)
-            self.image_features_ref = outputs1.last_hidden_state[0, 1 : , ...]
-            self.L2_loss = nn.MSELoss()
+        self.last_resample_iteration = self.last_reset_iteration = -1
+        self.start_sdf_regularization_from = self.cfg.start_sdf_regularization_from
+        # reset neighbor
+        self.reset_neighbors_every = self.cfg.reset_neighbors_every
+        self.start_reset_neighbors_from = self.cfg.start_reset_neighbors_from
 
-        if self.cfg.loss['lambda_collision'] > 0.0 and self.geometry.cfg.optimize_layout:
-            self.mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
-            disparse_lst = []
-            means_lst = []
-            for item in range(self.geometry.num_layouts):
-                if item == 0:
-                    pc = self.geometry.get_xyz[0:self.mark_accum[item]]
-                else:
-                    pc = self.geometry.get_xyz[self.mark_accum[item-1]:self.mark_accum[item]]
-                pc_mean = torch.mean(pc, dim=0)
-                means_lst.append(pc_mean)
-                distance_tensor = torch.norm(pc - pc_mean, dim=-1, keepdim=True)
-                disp = torch.mean(distance_tensor)
-                disparse_lst.append(disp)
-
-            self.disparity_lst = disparse_lst # the mean distance of gaussians to each instance
+        torch.set_rng_state(rng_state)
 
     def calculate_collision(self, pc1, pc2):
         """
@@ -210,14 +273,14 @@ class LayoutGSSystem(BaseLift3DSystem):
                 camera_distances * torch.cos(elevation) * torch.sin(azimuth),
                 camera_distances * torch.sin(elevation),
             ],
-            dim=-1,)
+            dim=-1, )
 
         # Not changed.
         center: Float[Tensor, "B 3"] = torch.zeros_like(camera_positions).to('cuda')
         # default camera up direction as +z
         up: Float[Tensor, "B 3"] = torch.as_tensor([0, 0, 1], dtype=torch.float32)[
-            None, :
-        ].repeat(batch_size, 1).to('cuda')
+                                   None, :
+                                   ].repeat(batch_size, 1).to('cuda')
 
         # fixed fovy
         fovy_deg: Float[Tensor, "B"] = (torch.tensor([49.1]).to('cuda'))
@@ -252,7 +315,8 @@ class LayoutGSSystem(BaseLift3DSystem):
         directions_unit_focal = get_ray_directions(H=height, W=height, focal=1.0)
 
         focal_length: Float[Tensor, "B"] = 0.5 * height / torch.tan(0.5 * fovy)
-        directions: Float[Tensor, "B H W 3"] = directions_unit_focal[None, :, :, :].repeat(batch_size, 1, 1, 1).to('cuda')
+        directions: Float[Tensor, "B H W 3"] = directions_unit_focal[None, :, :, :].repeat(batch_size, 1, 1, 1).to(
+            'cuda')
         directions[:, :, :, :2] = (directions[:, :, :, :2] / focal_length[:, None, None, None])
 
         # Importance note: the returned rays_d MUST be normalized!
@@ -294,8 +358,42 @@ class LayoutGSSystem(BaseLift3DSystem):
         return [optim]
 
     def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
-        self.geometry.update_learning_rate(self.global_step)
-        outputs = self.renderer.batch_forward(batch, instance_id)
+
+        # Update learning rates
+        # if self.global_step >= 9000:
+
+        udfnet_lr = self.sugar.neus.get_learning_rate_at_iteration(self.global_step, max_iter=1600)
+        self.sugar_optimizer.update_learning_rate(self.global_step, sdfnet_lr=udfnet_lr)
+
+        # rasterizer setting
+        current_sh_levels = sh_levels = 4
+        compute_color_in_rasterizer = False
+        use_same_scale_in_all_directions = False  # Should be False
+
+        enforce_entropy_regularization = True
+        white_bg = True
+
+        # render the image
+        # TODO: delete useless param in rasterizer
+        outputs = self.sugar.render_image_gaussian_rasterizer(
+            batch,
+            verbose=False,
+            comp_rgb_bg=self.background,
+            material=self.material,
+            bg_color=torch.Tensor([1.0, 1.0, 1.0]).to(self.sugar.device) if white_bg else None,
+            sh_deg=current_sh_levels - 1,
+            sh_rotations=None,
+            compute_color_in_rasterizer=compute_color_in_rasterizer,
+            compute_covariance_in_rasterizer=True,
+            return_2d_radii=True,
+            quaternions=None,
+            use_same_scale_in_all_directions=use_same_scale_in_all_directions,
+            return_opacities=enforce_entropy_regularization,
+            use_pulled=False,
+        )
+
+        # self.geometry.update_learning_rate(self.global_step)
+        # outputs = self.renderer.batch_forward(batch, instance_id)
         return outputs
 
     def training_step(self, batch, batch_idx):
@@ -312,16 +410,14 @@ class LayoutGSSystem(BaseLift3DSystem):
                 instance_id = 1
                 self.geometry.selected_instance_id = 1
                 prompt_utils = self.prompt_utils_list[1]
-
             else:
                 instance_id = -1
                 self.geometry.selected_instance_id = -1
                 prompt_utils = self.prompt_utils_list[2]
-        # ssyl===============select the gaussians for each instance=====>
         else:
             prompt_utils = self.prompt_utils
 
-        # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
+        # syl ==========================在只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
         if instance_id != -1:
             rand_num = np.random.rand()
             rand_num = 0.1
@@ -352,13 +448,14 @@ class LayoutGSSystem(BaseLift3DSystem):
 
         self.log(
             "gauss_num",
-            int(self.geometry.get_xyz.shape[0]),
+            int(self.sugar.points.shape[0]),
             on_step=True,
             on_epoch=True,
             prog_bar=True,
             logger=True,
         )
 
+        # sds loss
         for name, value in guidance_out.items():
             self.log(f"train/{name}", value)
             if name.startswith("loss_"):
@@ -366,17 +463,142 @@ class LayoutGSSystem(BaseLift3DSystem):
                     self.cfg.loss[name.replace("loss_", "lambda_")]
                 )
 
+        # step: sdf loss
+        # if iteration > 7000
+        has_not_pruned = True
+        prune_hard_opacity_threshold = 0.05
+        sugar_checkpoint_path = os.path.join(self.get_save_dir(), 'sugar')
+
+        # step: prune the gaussian before sdf loss
+        if self.global_step == 0 and has_not_pruned:
+            print("Prunning Pointcloud Using Opacity...")
+            prune_mask = (self.gaussian_densifier.model.strengths < prune_hard_opacity_threshold).squeeze()
+            self.gaussian_densifier.prune_points(prune_mask)
+            print('After Prunning: {} Gaussians Left.'.format(self.sugar.points.shape[0]))
+
+            self.sugar.visual_point_cloud(iteration=9001, checkpoint_path=sugar_checkpoint_path)
+            self.sugar.neus.reset_datasets(
+                sugar_checkpoint_path,
+                self.sugar.points.detach().cpu().numpy(),
+                iteration=9000,
+                scene_name='threestudio')
+            has_not_pruned = False
+
+        # step: reset dataset every 1000 iter
+        if self.global_step % 1000 == 0 and self.global_step != self.last_resample_iteration and self.global_step > 9500:
+            if self.global_step % 2000 == 0:
+                print('Recalculating Sample Points...')
+                self.sugar.neus.reset_datasets(
+                    sugar_checkpoint_path,
+                    self.sugar.points.detach().cpu().numpy(),
+                    iteration=self.global_step,
+                    scene_name='threestudio')
+            self.last_resample_iteration = self.global_step
+
+        # step: start sdf regularization
+        if self.global_step >= self.start_sdf_regularization_from:
+            # reset neighbors at start and at every interval
+            if ((self.global_step >= self.start_reset_neighbors_from) and
+                ((self.global_step == self.start_sdf_regularization_from + 1) or
+                 (self.global_step % self.reset_neighbors_every == 0)) and self.global_step != self.last_reset_iteration):
+                print("\n---INFO---\nResetting neighbors...")
+                self.sugar.reset_neighbors()
+                self.last_reset_iteration = self.global_step
+            # scaling loss
+            train_scaling = True  # fixme: fixed condition
+            if train_scaling:
+                # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
+                clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-4)
+                scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
+                loss = loss + 100 * scaling_loss
+
+            # pulling loss
+            train_sdf = True  # fixme: fixed condition
+            cur_part_num = 1
+            if train_sdf:
+                sugar_points = self.sugar.points
+                dataset = getattr(self.sugar.neus, 'dataset' + str(cur_part_num))
+                points, samples, point_gt, points_idx = dataset.get_train_data(10000)
+                samples.requires_grad = True
+
+                # sdf loss 1
+                sdf_network = getattr(self.sugar.neus, 'sdf_network' + str(cur_part_num))
+                gradients_sample = sdf_network.gradient(samples).squeeze()  # 5000x3
+                udf_sample = sdf_network.sdf(samples)  # 5000x1
+                grad_norm = F.normalize(gradients_sample, dim=1)  # 5000x3
+                sample_moved = samples - grad_norm * udf_sample  # 5000x3
+                # update the sdf network not the gs points
+                sdf_loss1 = self.sugar.neus.ChamferDisL1(points.unsqueeze(0), sample_moved.unsqueeze(0))
+
+                # sdf loss 2 = loss pull in the paper
+                scaled_sample_moved = sample_moved * dataset.shape_scale + dataset.shape_center
+                knn = knn_points(sample_moved[None], points[None], K=1)
+                knn_idx = knn.idx[0, :, 0]
+                # gaussian_inv_scaled_rotation = sugar.get_covariance(
+                #     return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=-1, enlarge_minaxis=-1)
+                gaussian_inv_scaled_rotation = self.sugar.get_covariance(
+                    return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=100,
+                    enlarge_minaxis=100)
+                batch_selected_idx = torch.arange(self.sugar.points.shape[0], device='cuda') \
+                    [dataset.part_select_idx][dataset.downsample_idx][points_idx][knn_idx]
+                closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[batch_selected_idx].detach()
+                surf_points = points[knn_idx].detach().clone() * dataset.shape_scale + dataset.shape_center
+
+                shift = (
+                        scaled_sample_moved - surf_points)  # NOTE: scaled_sample_moved = q, surf_points = /mu_j (no gradient, updating the sdf)
+                warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
+                neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
+                neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
+                if self.global_step > 10000:
+                    sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
+                else:
+                    sdf_loss2 = 0.
+                sdf_loss = 1.0 * sdf_loss1 + 1.0 * sdf_loss2
+
+                # ours: pull gs
+                if self.global_step > 10000:  # delay for very large scene
+                    rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
+                    _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
+                    _udf_sample = sdf_network.sdf(rescaled_sugar_points)
+                    _grad_norm = F.normalize(_gradients_sample, dim=1)  #
+                    rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
+                    sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
+                    sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
+                                                   dim=-1).mean()
+                    sdf_loss = sdf_loss + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
+
+                loss = loss + sdf_loss
+
+                # norm consistency
+                train_normal = True  # fixme
+                if train_normal:
+                    assert train_sdf, 'require train_sdf=True for train_normal!'
+                    if self.global_step > 10000:   # delay for very large scene
+                        sugar_normals = self.sugar.get_normals()[batch_selected_idx]
+                        surf_normals = _grad_norm.detach()
+                        sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
+
+                        if self.global_step > 12000:   # delay for very large scene
+                            gaussian_center_normals = sugar_normals.detach()
+                            query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  #NOTE: update sdf normal
+                        else:
+                            query_normal_loss = 0.
+
+                        normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
+
+                        loss = loss + normal_loss
+
         # gaussian related losses
 
         xyz_mean = None
         if self.cfg.loss["lambda_position"] > 0.0:
-            xyz_mean = self.geometry.get_xyz.norm(dim=-1)
+            xyz_mean = self.sugar.points.norm(dim=-1)
             loss_position = xyz_mean.mean()
             self.log(f"train/loss_position", loss_position)
             loss += self.C(self.cfg.loss["lambda_position"]) * loss_position
 
         if self.cfg.loss["lambda_opacity"] > 0.0:
-            scaling = self.geometry.get_scaling.norm(dim=-1)
+            scaling = self.sugar.scaling.norm(dim=-1)
             loss_opacity = (
                 scaling.detach().unsqueeze(-1) * self.geometry.get_opacity
             ).sum()
@@ -384,12 +606,12 @@ class LayoutGSSystem(BaseLift3DSystem):
             loss += self.C(self.cfg.loss["lambda_opacity"]) * loss_opacity
 
         if self.cfg.loss["lambda_sparsity"] > 0.0:
-            loss_sparsity = -(self.geometry.get_opacity - 0.5).pow(2).mean()
+            loss_sparsity = -(self.sugar.strengths - 0.5).pow(2).mean()
             self.log("train/loss_sparsity", loss_sparsity)
             loss += loss_sparsity * self.C(self.cfg.loss.lambda_sparsity)
 
         if self.cfg.loss["lambda_scales"] > 0.0:
-            scale_sum = torch.sum(self.geometry.get_scaling)
+            scale_sum = torch.sum(self.sugar.scaling)
             self.log(f"train/scales", scale_sum)
             loss += self.C(self.cfg.loss["lambda_scales"]) * scale_sum
 
@@ -419,14 +641,18 @@ class LayoutGSSystem(BaseLift3DSystem):
                     "comp_normal is required for 2D normal smooth loss, no comp_normal is found in the output."
                 )
             normal = out["comp_normal"]
-            loss_normal_smooth = self.C(self.cfg.loss["lambda_normal_smooth_loss"]) * ((
-                normal[:, 1:, :, :] - normal[:, :-1, :, :]).square().mean() \
-                + (normal[:, :, 1:, :] - normal[:, :, :-1, :]).square().mean())
+            loss_normal_smooth = self.C(self.cfg.loss["lambda_normal_smooth_loss"]) * ((normal[:, 1:, :, :] - normal[
+                                                                                                                 :, :-1,
+                                                                                                                 :,
+                                                                                                                 :]).square().mean() \
+                                                                                       + (normal[:, :, 1:, :] - normal[
+                                                                                                                :, :,
+                                                                                                                :-1,
+                                                                                                                :]).square().mean())
             self.log(f"train/loss_normal_smooth", loss_normal_smooth)
             loss += loss_normal_smooth
 
         # =========== Normal losses =========== #
-
 
         # =========== Layout refinement losses =========== #
         loss_layout = 0.0
@@ -435,21 +661,21 @@ class LayoutGSSystem(BaseLift3DSystem):
         # reference loss
         if self.cfg.loss['lambda_feat_recon_loss'] > 0.0:
             out_frontal = self(self.frontal_batch)
-            front_view = out_frontal["comp_rgb"] # in torch format
+            front_view = out_frontal["comp_rgb"]  # in torch format
             # front_mask = out_frontal["mask"]
 
             sav = (front_view * 256)[0].detach().cpu().numpy().astype(np.uint8)
             pil_image = Image.fromarray(sav)
             pil_image.save('./custom/threestudio-3dgs/render.png')
 
-            with torch.no_grad(): #disable DINOv2 update
+            with torch.no_grad():  #disable DINOv2 update
                 outputs2 = self.feat_model(pixel_values=front_view.permute(0, 3, 1, 2))
-            image_features_rendered = outputs2.last_hidden_state[0, 1 : , ...]
+            image_features_rendered = outputs2.last_hidden_state[0, 1:, ...]
             # Here apply feature level L2 loss, mean
-            loss_ref = self.L2_loss(image_features_rendered.view(-1), self.image_features_ref.view(-1)) * self.cfg.loss['lambda_feat_recon_loss']
+            loss_ref = self.L2_loss(image_features_rendered.view(-1), self.image_features_ref.view(-1)) * self.cfg.loss[
+                'lambda_feat_recon_loss']
             self.log(f"train/loss_reference", loss_ref)
             loss_layout += loss_ref
-
 
         # collision loss
         if self.cfg.loss['lambda_collision'] > 0.0 and self.global_step % 5 == 0:
@@ -458,7 +684,8 @@ class LayoutGSSystem(BaseLift3DSystem):
 
             means3D = self.geometry.get_xyz * 1.0
             if self.geometry.cfg.optimize_layout:
-                means3D[..., 0] = means3D[..., 0] + torch.repeat_interleave(self.geometry.get_layout_depths, self.geometry.mark_instances)
+                means3D[..., 0] = means3D[..., 0] + torch.repeat_interleave(self.geometry.get_layout_depths,
+                                                                            self.geometry.mark_instances)
             # in a true iteration only sample two instances.
             if selected_instance_nums[0] == 0:
                 pc1 = means3D[: self.mark_accum[0]]
@@ -476,12 +703,13 @@ class LayoutGSSystem(BaseLift3DSystem):
             # pc1 - pc2_m - sp2 + 0.5sp1 , moderate tolerance.
 
             dist_inter = torch.norm(pc1 - mean_pc2, dim=-1, keepdim=True) - \
-                         self.disparity_lst[selected_instance_nums[1]] # + \
-                         # 0.5 * self.disparity_lst[selected_instance_nums[0]] \
+                         self.disparity_lst[selected_instance_nums[1]]  # + \
+            # 0.5 * self.disparity_lst[selected_instance_nums[0]] \
 
             hinge_distances = F.relu(-dist_inter)
             # annealing strategy.
-            loss_collision = torch.sum(hinge_distances) * self.cfg.loss['lambda_collision'] * (1 - self.global_step / self.trainer.max_steps)
+            loss_collision = torch.sum(hinge_distances) * self.cfg.loss['lambda_collision'] * (
+                1 - self.global_step / self.trainer.max_steps)
             self.log(f"train/loss_collision", loss_collision)
             loss_layout += loss_collision
 
@@ -492,42 +720,46 @@ class LayoutGSSystem(BaseLift3DSystem):
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
 
-        # syl =================================== find instance filter
-        instance_filter = torch.zeros(self.geometry.get_xyz.shape[0], device=self.geometry.get_xyz.device)
-        mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
-        if instance_id == 0:
-            instance_filter[0: mark_accum[instance_id]] = 1
-        elif instance_id == 1:
-            instance_filter[mark_accum[instance_id - 1]: mark_accum[instance_id]] = 1
-        else:
-            instance_filter[:] = 1
+        # # syl =================================== find instance filter
+        # # instance_filter = torch.zeros(self.geometry.get_xyz.shape[0], device=self.geometry.get_xyz.device)
+        # instance_filter = torch.zeros(self.sugar.points.shape[0], device=self.sugar.points.device)
+        # mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
+        # if instance_id == 0:
+        #     instance_filter[0: mark_accum[instance_id]] = 1
+        # elif instance_id == 1:
+        #     instance_filter[mark_accum[instance_id - 1]: mark_accum[instance_id]] = 1
+        # else:
+        #     instance_filter[:] = 1
 
-        for i, view_filter in enumerate(visibility_filter):  # MV dream has 4 views (seems they are all the same)
-            visibility_filter[i] = view_filter & (instance_filter != 0)
+        # for i, view_filter in enumerate(visibility_filter):  # MV dream has 4 views (seems they are all the same)
+        #     visibility_filter[i] = view_filter & (instance_filter != 0)
 
         loss_sds.backward(retain_graph=True)
         iteration = self.global_step
 
-        self.geometry.update_states(
-            iteration,
-            visibility_filter,
-            radii,
-            viewspace_point_tensor,
-        )
+        # self.geometry.update_states(
+        #     iteration,
+        #     visibility_filter,
+        #     radii,
+        #     viewspace_point_tensor,
+        # )
 
         if loss > 0:
             loss.backward()
 
         # step: 清除其他inst的梯度
-        if instance_id != -1:
-            mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0).cpu()
-            if instance_id == 0:
-                instance_range = np.arange(0, mark_accum[instance_id])
-            else:
-                instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
-            zero_grad_inst(self.geometry, instance_range)
+        # if instance_id != -1:
+        #     mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0).cpu()
+        #     if instance_id == 0:
+        #         instance_range = np.arange(0, mark_accum[instance_id])
+        #     else:
+        #         instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
+        #     zero_grad_inst(self.geometry, instance_range)
         opt.step()
         opt.zero_grad(set_to_none=True)
+
+        self.sugar_optimizer.step()
+        self.sugar_optimizer.zero_grad(set_to_none = True)
 
         return {"loss": loss_sds}
 
@@ -635,7 +867,7 @@ class LayoutGSSystem(BaseLift3DSystem):
     def test_step(self, batch, batch_idx):
         out = self(batch)
         self.save_image_grid(
-            f"it{self.global_step}-test/{batch['index'][0]}.png",
+            f"it{self.true_global_step}-test/{batch['index'][0]}.png",
             [
                 {
                     "type": "rgb",
@@ -666,11 +898,11 @@ class LayoutGSSystem(BaseLift3DSystem):
                 else []
             ),
             name="test_step",
-            step=self.global_step,
+            step=self.true_global_step,
         )
         if batch["index"][0] == 0:
-            save_path = self.get_save_path("point_cloud.ply")
-            self.geometry.save_ply(save_path)
+            save_path = self.get_save_path('point_cloud.ply')
+            self.sugar.save_ply(checkpoint_path=os.path.dirname(save_path), iteration=self.true_global_step)
 
     def on_test_epoch_end(self):
         self.save_img_sequence(
@@ -683,6 +915,20 @@ class LayoutGSSystem(BaseLift3DSystem):
             step=self.true_global_step,
         )
         print('The optimized 3D layout depths:', self.geometry.get_layout_depths)
+
+    def load_gaussian_checkpoint(self, ckpt_path) -> None:
+        ckpt_dict = torch.load(ckpt_path, map_location="cpu")
+        num_pts = ckpt_dict["state_dict"]["geometry._xyz"].shape[0]
+        pcd = BasicPointCloud(
+            points=np.zeros((num_pts, 3)),
+            colors=np.zeros((num_pts, 3)),
+            normals=np.zeros((num_pts, 3)),
+        )
+        self.geometry.create_from_pcd(pcd, 10)
+        self.geometry.training_setup()  # setup learning rate
+        # super().on_load_checkpoint(ckpt_dict)
+        # self.material.load_state_dict(ckpt_dict["state_dict"][""])
+        self.load_state_dict(ckpt_dict["state_dict"])
 
 
 def zero_grad_inst(pc, instance_range):
@@ -701,3 +947,7 @@ def zero_grad_inst(pc, instance_range):
     pc._opacity.grad[~keep_mask] = 0
     pc._scaling.grad[~keep_mask] = 0
     pc._rotation.grad[~keep_mask] = 0
+
+
+if __name__ == '__main__':
+    debug_class = LayoutCHIGSSystem()

@@ -216,6 +216,7 @@ class DiffGaussian(Rasterizer, GaussianBatchRenderer):
             albedo=(rendered_image / (rendered_alpha + 1e-6)).permute(1, 2, 0),
             light_positions=light_positions,
         ).permute(2, 0, 1)
+
         rendered_image = rgb_fg * rendered_alpha + (
             1 - rendered_alpha
         ) * comp_rgb_bg.reshape(H, W, 3).permute(2, 0, 1)

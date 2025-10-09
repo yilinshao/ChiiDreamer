@@ -360,7 +360,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
             elif os.path.isdir(self.cfg.geometry_convert_from):
                 self.pre_process_instances()
                 # HERE WE NEED A CUSTOM LOADING FUNCTION FOR XYZ
-                self.load_ply(os.path.join(self.cfg.geometry_convert_from, 'composed.ply'))
+                self.load_ply(os.path.join(self.cfg.geometry_convert_from, 'composed.ply'), for_layout=True)
                 if self.cfg.optimize_gaussians and not self.cfg.optimize_layout:
                     self.training_setup()
                 else:
@@ -388,6 +388,9 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
 
             self.create_from_pcd(pcd, 10)
             self.training_setup()
+
+        # syl: this was not initialized in the origin code
+        self.color_clip = self.cfg.color_clip
 
 # custom functions for pre-composing instances and storage.
     def pre_process_instances(self):
@@ -435,7 +438,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
             depth_max = np.max(depth_map)
             depth_map = depth_map_to_3d(depth_map, K, depth_min = depth_min, depth_max = depth_max)  # [0, 1]
             masks = []
-            depths=  []
+            depths = []
             for msk in msks:
                 if 'instance' not in msk:
                     continue
@@ -470,9 +473,10 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
             instance = transform_gaussians(item, self.scaling_factors[i], self.box_configs[i])
             instances.append(instance)
             num_gaussians.append(item.shape[0])
-        self.mark_instances = torch.tensor(num_gaussians, device='cuda')
-        self.instance_ids = [np.full(n, idx, dtype=np.int32) for idx, n in enumerate(num_gaussians)]
-        # NOTE: can be concated with instance_ids_all = np.concatenate(instance_ids)
+
+        # syl: mark gaussian number for every instance, mark_instance = (54774, 65498), type=torch.tensor,
+        mark_instances = torch.tensor(num_gaussians, device='cuda')
+        self.register_buffer("mark_instances", mark_instances)
 
         fitin_gaussians = torch.cat(instances, dim=0)
         save_ply(torch.unsqueeze(fitin_gaussians, dim=0), os.path.join(self.cfg.geometry_convert_from, 'composed.ply'))

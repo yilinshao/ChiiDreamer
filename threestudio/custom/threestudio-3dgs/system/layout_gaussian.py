@@ -24,7 +24,7 @@ from threestudio.utils.ops import (
 )
 from torch_kdtree import build_kd_tree
 
-# from ..geometry.gaussian_base import BasicPointCloud
+from ..geometry.gaussian_base import BasicPointCloud
 
 '''
 Here we assume the given condition are 2D layout boxes, and given in the CONFIG files. The layout is loaded in the initialization process.
@@ -40,18 +40,35 @@ TODO@: Implementing loading Layouy 2D boxes and then transform into 3D boxes.
 HERE WE MENTION THAT: at the end of each iteration, we should update the given xyz.
 '''
 
+
 @threestudio.register("gaussian-splatting-layout-system")
 class LayoutGSSystem(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         visualize_samples: bool = False
+        gaussian_checkpoint: str = None
 
     cfg: Config
+
+    def load_gaussian_checkpoint(self, ckpt_path) -> None:
+        ckpt_dict = torch.load(ckpt_path, map_location="cpu")
+        num_pts = ckpt_dict["state_dict"]["geometry._xyz"].shape[0]
+        pcd = BasicPointCloud(
+            points=np.zeros((num_pts, 3)),
+            colors=np.zeros((num_pts, 3)),
+            normals=np.zeros((num_pts, 3)),
+        )
+        self.geometry.create_from_pcd(pcd, 10)
+        self.geometry.training_setup()  # setup learning rate
+        # super().on_load_checkpoint(ckpt_dict)
+        self.load_state_dict(ckpt_dict["state_dict"])
 
     def configure(self) -> None:
         # set up geometry, material, background, renderer
         # self.pre_process_instances()
         super().configure()
+        self.load_gaussian_checkpoint(self.cfg.gaussian_checkpoint)
+
         self.automatic_optimization = False
         # self.lpips = LPIPS(net='vgg').to(self.device)
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
@@ -109,6 +126,7 @@ class LayoutGSSystem(BaseLift3DSystem):
                 disparse_lst.append(disp)
 
             self.disparity_lst = disparse_lst # the mean distance of gaussians to each instance
+
 
     def calculate_collision(self, pc1, pc2):
         """
@@ -470,7 +488,7 @@ class LayoutGSSystem(BaseLift3DSystem):
             else:
                 instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
             zero_grad_inst(self.geometry, instance_range)
-        opt.step()
+        # opt.step()
         opt.zero_grad(set_to_none=True)
 
         return {"loss": loss_sds}
@@ -628,6 +646,17 @@ class LayoutGSSystem(BaseLift3DSystem):
         )
         print('The optimized 3D layout depths:', self.geometry.get_layout_depths)
 
+    def on_load_checkpoint(self, ckpt_dict) -> None:
+        num_pts = ckpt_dict["state_dict"]["geometry._xyz"].shape[0]
+        pcd = BasicPointCloud(
+            points=np.zeros((num_pts, 3)),
+            colors=np.zeros((num_pts, 3)),
+            normals=np.zeros((num_pts, 3)),
+        )
+        self.geometry.create_from_pcd(pcd, 10)
+        self.geometry.training_setup()
+        super().on_load_checkpoint(ckpt_dict)
+
 
 def zero_grad_inst(pc, instance_range):
     # note: 经过prune和densify之后,因为替换了optimizer中的 parameter, 梯度也会清零
@@ -645,3 +674,6 @@ def zero_grad_inst(pc, instance_range):
     pc._opacity.grad[~keep_mask] = 0
     pc._scaling.grad[~keep_mask] = 0
     pc._rotation.grad[~keep_mask] = 0
+
+if __name__ == '__main__':
+    debug_class = LayoutGSSystem()

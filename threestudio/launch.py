@@ -240,7 +240,11 @@ def main(args, extras) -> None:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         system.set_resume_status(ckpt["epoch"], ckpt["global_step"])
 
+    show_loaded_gaussians = False
     if args.train:
+        if show_loaded_gaussians:
+            print("Show loaded gaussians")
+            trainer.test(system, dm)
         trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
         trainer.test(system, datamodule=dm)
         if args.gradio:

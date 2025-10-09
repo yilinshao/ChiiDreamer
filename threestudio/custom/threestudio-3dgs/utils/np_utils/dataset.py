@@ -189,12 +189,12 @@ class Dataset:
                         (np.max(pointcloud[:, 1]) + np.min(pointcloud[:, 1])) / 2,
                         (np.max(pointcloud[:, 2]) + np.min(pointcloud[:, 2])) / 2]
         if old_shape_center is None:
-            self.shape_center = torch.tensor(shape_center,dtype=torch.float).to(self.device)
+            self.shape_center = torch.tensor(shape_center, dtype=torch.float).to(self.device)
         else:
             self.shape_center = old_shape_center
             print('load old shape center.')
         if old_shape_scale is None:
-            self.shape_scale = torch.tensor([shape_scale],dtype=torch.float).to(self.device)
+            self.shape_scale = torch.tensor([shape_scale], dtype=torch.float).to(self.device)
         else:
             self.shape_scale = old_shape_scale
             print('load old shape center.')

@@ -3,14 +3,14 @@ sys.path.append('./gaussian_splatting')
 import os
 import torch
 import plotly.graph_objs as go
-from gaussian_splatting.scene.gaussian_model import GaussianModel
-from gaussian_splatting.gaussian_renderer import render as gs_render
-from gaussian_splatting.scene.dataset_readers import fetchPly
-from sugar_utils.spherical_harmonics import SH2RGB
+from ..gaussian_splatting.scene.gaussian_model import GaussianModel
+from ..gaussian_splatting.gaussian_renderer import render as gs_render
+from ..gaussian_splatting.scene.dataset_readers import fetchPly
+from ..utils.sugar_utils.spherical_harmonics import SH2RGB
 from .cameras import CamerasWrapper, load_gs_cameras
 
 
-class ModelParams(): 
+class ModelParams():
     """Parameters of the Gaussian Splatting model.
     Largely inspired by the original implementation of the 3D Gaussian Splatting paper:
     https://github.com/graphdeco-inria/gaussian-splatting
@@ -24,8 +24,8 @@ class ModelParams():
         self.white_background = False
         self.data_device = "cuda"
         self.eval = False
-    
-        
+
+
 class PipelineParams():
     """Parameters of the Gaussian Splatting pipeline.
     Largely inspired by the original implementation of the 3D Gaussian Splatting paper:
@@ -64,7 +64,7 @@ class OptimizationParams():
 class GaussianSplattingWrapper:
     """Class to wrap original Gaussian Splatting models and facilitates both usage and integration with PyTorch3D.
     """
-    def __init__(self, 
+    def __init__(self,
                  source_path: str,
                  output_path: str,
                  iteration_to_load:int=30_000,
@@ -78,7 +78,7 @@ class GaussianSplattingWrapper:
                  image_resolution=1,
                  ) -> None:
         """Initialize the Gaussian Splatting model wrapper.
-        
+
         Args:
             source_path (str): Path to the directory containing the source images.
             output_path (str): Path to the directory containing the output of the Gaussian Splatting optimization.
@@ -88,28 +88,28 @@ class GaussianSplattingWrapper:
             opt_params (OptimizationParams, optional): Optimization parameters. Defaults to None.
             load_gt_images (bool, optional): If True, will load all GT images in the source folder.
                 Useful for evaluating the model, but loading can take a few minutes. Defaults to True.
-            eval_split (bool, optional): If True, will split images and cameras into a training set and an evaluation set. 
+            eval_split (bool, optional): If True, will split images and cameras into a training set and an evaluation set.
                 Defaults to False.
-            eval_split_interval (int, optional): Every eval_split_interval images, an image is added to the evaluation set. 
+            eval_split_interval (int, optional): Every eval_split_interval images, an image is added to the evaluation set.
                 Defaults to 8 (following standard practice).
         """
         self.source_path = source_path
         self.output_path = output_path
         self.loaded_iteration = iteration_to_load
-        
+
         if model_params is None:
             model_params = ModelParams()
         if pipeline_params is None:
             pipeline_params = PipelineParams()
         if opt_params is None:
             opt_params = OptimizationParams()
-        
+
         self.model_params = model_params
         self.pipeline_params = pipeline_params
         self.opt_params = opt_params
-        
+
         self._C0 = 0.28209479177387814
-        
+
         cam_list = load_gs_cameras(
             source_path=source_path,
             gs_output_path=output_path,
@@ -153,50 +153,50 @@ class GaussianSplattingWrapper:
     def device(self):
         with torch.no_grad():
             return self.gaussians.get_xyz.device
-    
+
     @property
     def image_height(self):
         return self.cam_list[0].image_height
-    
+
     @property
     def image_width(self):
         return self.cam_list[0].image_width
-    
+
     def render_image(
         self,
-        nerf_cameras:CamerasWrapper=None, 
+        nerf_cameras:CamerasWrapper=None,
         camera_indices:int=0,
         return_whole_package=False):
         """Render an image with Gaussian Splatting rasterizer.
 
         Args:
-            nerf_cameras (CamerasWrapper, optional): Set of cameras. 
+            nerf_cameras (CamerasWrapper, optional): Set of cameras.
                 If None, uses the training cameras, but can be any set of cameras. Defaults to None.
-            camera_indices (int, optional): Index of the camera to render in the set of cameras. 
+            camera_indices (int, optional): Index of the camera to render in the set of cameras.
                 Defaults to 0.
-            return_whole_package (bool, optional): If True, returns the whole output package 
+            return_whole_package (bool, optional): If True, returns the whole output package
                 as computed in the original rasterizer from 3D Gaussian Splatting paper. Defaults to False.
 
         Returns:
             Tensor or Dict: A tensor of the rendered RGB image, or the whole output package.
         """
-        
+
         if nerf_cameras is None:
             gs_cameras = self.cam_list
         else:
             gs_cameras = nerf_cameras.gs_cameras
-        
+
         camera = gs_cameras[camera_indices]
-        render_pkg = gs_render(camera, self.gaussians, 
-                            self.pipeline_params, 
+        render_pkg = gs_render(camera, self.gaussians,
+                            self.pipeline_params,
                             bg_color=torch.zeros(3, device='cuda'))
-        
+
         if return_whole_package:
             return render_pkg
         else:
             image = render_pkg["render"]
             return image.permute(1, 2, 0)
-    
+
     def get_gt_image(self, camera_indices:int, to_cuda=False):
         """Returns the ground truth image corresponding to the training camera at the given index.
 
@@ -211,14 +211,14 @@ class GaussianSplattingWrapper:
         if to_cuda:
             gt_image = gt_image.cuda()
         return gt_image.permute(1, 2, 0)
-    
+
     def get_test_gt_image(self, camera_indices:int, to_cuda=False):
         """Returns the ground truth image corresponding to the test camera at the given index.
-        
+
         Args:
             camera_indices (int): Index of the camera in the set of cameras.
             to_cuda (bool, optional): If True, moves the image to GPU. Defaults to False.
-        
+
         Returns:
             Tensor: The ground truth image.
         """
@@ -226,7 +226,7 @@ class GaussianSplattingWrapper:
         if to_cuda:
             gt_image = gt_image.cuda()
         return gt_image.permute(1, 2, 0)
-    
+
     def downscale_output_resolution(self, downscale_factor):
         """Downscale the output resolution of the Gaussian Splatting model.
 
@@ -234,7 +234,7 @@ class GaussianSplattingWrapper:
             downscale_factor (float): Factor by which to downscale the resolution.
         """
         self.training_cameras.rescale_output_resolution(1.0 / downscale_factor)
-    
+
     def generate_point_cloud(self):
         """Generate a point cloud from the Gaussian Splatting model.
 
@@ -246,9 +246,9 @@ class GaussianSplattingWrapper:
             points = self.gaussians.get_xyz
             # colors = self.gaussians.get_features[:, 0] * self._C0 + 0.5
             colors = SH2RGB(self.gaussians.get_features[:, 0])
-            
+
         return points, colors
-    
+
     def plot_point_cloud(
         self,
         points=None,
@@ -272,7 +272,7 @@ class GaussianSplattingWrapper:
         Returns:
             go.Figure: The plotly figure.
         """
-        
+
         with torch.no_grad():
             if points is None:
                 points, colors = self.generate_point_cloud()
@@ -306,4 +306,17 @@ class GaussianSplattingWrapper:
 
             # fig.show()
             return fig
-        
+
+
+class PseudoCamera:
+    def __init__(self, height, width):
+        self.height = [height]
+        self.width = [width]
+
+
+class PseudoGaussianSplattingWrapper:
+    def __init__(self, device, height, width, cam_radius, gaussian_model):
+        self.device = device
+        self.training_cameras = PseudoCamera(height, width)
+        self.camera_radius = cam_radius
+        self.gaussians = gaussian_model

@@ -14,18 +14,99 @@ from pytorch3d.renderer import RasterizationSettings, MeshRasterizer
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from sugar_utils.spherical_harmonics import (
+from ..utils.sugar_utils.spherical_harmonics import (
     eval_sh, RGB2SH, SH2RGB,
 )
-from sugar_utils.graphics_utils import *
-from sugar_utils.general_utils import inverse_sigmoid
-from sugar_scene.gs_model import GaussianSplattingWrapper
-from sugar_scene.cameras import CamerasWrapper
+from ..utils.sugar_utils.graphics_utils import *
+from ..utils.sugar_utils.general_utils import inverse_sigmoid
+from .gs_model import GaussianSplattingWrapper, PseudoGaussianSplattingWrapper
+from .cameras import CamerasWrapper
 
+from threestudio.utils.ops import get_cam_info_gaussian
+from torch.cuda.amp import autocast
+
+from ..geometry.gaussian_base import BasicPointCloud, Camera
+import torch
+import numpy as np
+import math
 
 scale_activation = torch.exp
 scale_inverse_activation = torch.log
-        
+
+
+def getProjectionMatrix(znear, zfar, fovX, fovY):
+    tanHalfFovY = math.tan((fovY / 2))
+    tanHalfFovX = math.tan((fovX / 2))
+
+    top = tanHalfFovY * znear
+    bottom = -top
+    right = tanHalfFovX * znear
+    left = -right
+
+    P = torch.zeros(4, 4)
+
+    z_sign = 1.0
+
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
+
+
+def getWorld2View(R, t, tensor=False):
+    if tensor:
+        Rt = torch.zeros(4, 4, device=R.device)
+        Rt[..., :3, :3] = R.transpose(-1, -2)
+        Rt[..., :3, 3] = t
+        Rt[..., 3, 3] = 1.0
+        return Rt
+    else:
+        Rt = np.zeros((4, 4))
+        Rt[:3, :3] = R.transpose()
+        Rt[:3, 3] = t
+        Rt[3, 3] = 1.0
+        return np.float32(Rt)
+
+
+def focal2fov(focal, pixels):
+    return 2*math.atan(pixels/(2*focal))
+
+
+class Depth2Normal(torch.nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.delzdelxkernel = torch.tensor(
+            [
+                [0.00000, 0.00000, 0.00000],
+                [-1.00000, 0.00000, 1.00000],
+                [0.00000, 0.00000, 0.00000],
+            ]
+        )
+        self.delzdelykernel = torch.tensor(
+            [
+                [0.00000, -1.00000, 0.00000],
+                [0.00000, 0.00000, 0.00000],
+                [0.0000, 1.00000, 0.00000],
+            ]
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        delzdelxkernel = self.delzdelxkernel.view(1, 1, 3, 3).to(x.device)
+        delzdelx = F.conv2d(
+            x.reshape(B * C, 1, H, W), delzdelxkernel, padding=1
+        ).reshape(B, C, H, W)
+        delzdelykernel = self.delzdelykernel.view(1, 1, 3, 3).to(x.device)
+        delzdely = F.conv2d(
+            x.reshape(B * C, 1, H, W), delzdelykernel, padding=1
+        ).reshape(B, C, H, W)
+        normal = -torch.cross(delzdelx, delzdely, dim=1)
+        return normal
+
 
 def _initialize_radiuses_gauss_rasterizer(sugar):
     """Function to initialize the  of a SuGaR model.
@@ -34,23 +115,25 @@ def _initialize_radiuses_gauss_rasterizer(sugar):
         sugar (SuGaR): SuGaR model.
 
     Returns:
-        Tensor: Tensor with shape (n_points, 4+3) containing 
+        Tensor: Tensor with shape (n_points, 4+3) containing
             the initial quaternions and scaling factors.
     """
     # Initialize learnable radiuses
-    sugar.image_height = int(sugar.nerfmodel.training_cameras.height[0].item())
-    sugar.image_width = int(sugar.nerfmodel.training_cameras.width[0].item())
-    
-    all_camera_centers = sugar.nerfmodel.training_cameras.camera_to_worlds[..., 3]
-    all_camera_dists = torch.cdist(sugar.points, all_camera_centers)[None]
-    d_charac = all_camera_dists.mean(-1, keepdim=True)
-    
+    sugar.image_height = int(sugar.nerfmodel.training_cameras.height[0])
+    sugar.image_width = int(sugar.nerfmodel.training_cameras.width[0])
+
+    # all_camera_centers = sugar.nerfmodel.training_cameras.camera_to_worlds[..., 3]
+    # all_camera_dists = torch.cdist(sugar.points, all_camera_centers)[None]
+    # d_charac = all_camera_dists.mean(-1, keepdim=True)
+
     ndc_factor = 1.
     sugar.min_ndc_radius = ndc_factor * 2. / min(sugar.image_height, sugar.image_width)
     sugar.max_ndc_radius = ndc_factor * 2. * 0.05  # 2. * 0.01
-    sugar.min_radius = sugar.min_ndc_radius / sugar.focal_factor * d_charac
-    sugar.max_radius = sugar.max_ndc_radius / sugar.focal_factor * d_charac
-    
+
+    # seems doesn't used
+    # sugar.min_radius = sugar.min_ndc_radius / sugar.focal_factor * d_charac
+    # sugar.max_radius = sugar.max_ndc_radius / sugar.focal_factor * d_charac
+
     knn = knn_points(sugar.points[None], sugar.points[None], K=4)
     use_sqrt = True
     use_mean = False
@@ -65,18 +148,18 @@ def _initialize_radiuses_gauss_rasterizer(sugar):
     else:
         print("Use min to initialize scales.")
         radiuses = knn_dists.min(-1, keepdim=True)[0].clamp_min(0.0000001) * initial_radius_normalization
-    
+
     res = inverse_radius_fn(radiuses=radiuses)
     sugar.radius_dim = res.shape[-1]
-    
+
     return res
 
 
 def radius_fn(radiuses:torch.Tensor, max_value=0.2):
     scales = scale_activation(radiuses[..., 4:])
     return (scales.abs().clamp(max=max_value).max(dim=-1, keepdim=True)[0])
-    
-    
+
+
 def inverse_radius_fn(radiuses:torch.Tensor):
     scales = scale_inverse_activation(radiuses.expand(-1, -1, 3).clone())
     quaternions = matrix_to_quaternion(
@@ -93,8 +176,8 @@ class SuGaR(nn.Module):
     However, this wrapper implementation may not be the most optimal one for memory usage, so we might change it in the future.
     """
     def __init__(
-        self, 
-        nerfmodel: GaussianSplattingWrapper,
+        self,
+        nerfmodel: GaussianSplattingWrapper or PseudoGaussianSplattingWrapper,
         points: torch.Tensor,
         colors: torch.Tensor,
         initialize:bool=True,
@@ -136,39 +219,39 @@ class SuGaR(nn.Module):
             learn_surface_mesh_scales (bool, optional): Whether to learn the scales of the bound Gaussians. Defaults to True.
             n_gaussians_per_surface_triangle (int, optional): Number of bound Gaussians per surface triangle. Defaults to 6.
         """
-        
+
         super(SuGaR, self).__init__()
-        
+
         self.nerfmodel = nerfmodel
         self.freeze_gaussians = freeze_gaussians
-        
+
         self.learn_positions = ((not learn_color_only) and learnable_positions) and (not freeze_gaussians)
         self.learn_opacities = (not learn_color_only) and (not freeze_gaussians)
         self.learn_scales = (not learn_color_only) and (not freeze_gaussians)
         self.learn_quaternions = (not learn_color_only) and (not freeze_gaussians)
         self.learnable_positions = learnable_positions
-        
+
         if surface_mesh_to_bind is not None:
             self.learn_surface_mesh_positions = learn_surface_mesh_positions
             self.binded_to_surface_mesh = True
             self.learn_surface_mesh_opacity = learn_surface_mesh_opacity
             self.learn_surface_mesh_scales = learn_surface_mesh_scales
             self.n_gaussians_per_surface_triangle = n_gaussians_per_surface_triangle
-            
+
             self.learn_positions = self.learn_surface_mesh_positions
             self.learn_scales = self.learn_surface_mesh_scales
             self.learn_quaternions = self.learn_surface_mesh_scales
             self.learn_opacities = self.learn_surface_mesh_opacity
-            
+
             self._surface_mesh_faces = torch.nn.Parameter(
-                torch.tensor(np.array(surface_mesh_to_bind.triangles)).to(nerfmodel.device), 
+                torch.tensor(np.array(surface_mesh_to_bind.triangles)).to(nerfmodel.device),
                 requires_grad=False).to(nerfmodel.device)
             if surface_mesh_thickness is None:
                 surface_mesh_thickness = nerfmodel.training_cameras.get_spatial_extent() / 1_000_000
             self.surface_mesh_thickness = torch.nn.Parameter(
-                torch.tensor(surface_mesh_thickness).to(nerfmodel.device), 
+                torch.tensor(surface_mesh_thickness).to(nerfmodel.device),
                 requires_grad=False).to(nerfmodel.device)
-            
+
             print("Binding radiance cloud to surface mesh...")
             if n_gaussians_per_surface_triangle == 1:
                 self.surface_triangle_circle_radius = 1. / 2. / np.sqrt(3.)
@@ -177,7 +260,7 @@ class SuGaR(nn.Module):
                     dtype=torch.float32,
                     device=nerfmodel.device,
                 )[..., None]
-            
+
             if n_gaussians_per_surface_triangle == 3:
                 self.surface_triangle_circle_radius = 1. / 2. / (np.sqrt(3.) + 1.)
                 self.surface_triangle_bary_coords = torch.tensor(
@@ -187,7 +270,7 @@ class SuGaR(nn.Module):
                     dtype=torch.float32,
                     device=nerfmodel.device,
                 )[..., None]
-            
+
             if n_gaussians_per_surface_triangle == 4:
                 self.surface_triangle_circle_radius = 1 / (4. * np.sqrt(3.))
                 self.surface_triangle_bary_coords = torch.tensor(
@@ -198,7 +281,7 @@ class SuGaR(nn.Module):
                     dtype=torch.float32,
                     device=nerfmodel.device,
                 )[..., None]  # n_gaussians_per_face, 3, 1
-                
+
             if n_gaussians_per_surface_triangle == 6:
                 self.surface_triangle_circle_radius = 1 / (4. + 2.*np.sqrt(3.))
                 self.surface_triangle_bary_coords = torch.tensor(
@@ -211,7 +294,7 @@ class SuGaR(nn.Module):
                     dtype=torch.float32,
                     device=nerfmodel.device,
                 )[..., None]
-                
+
             points = torch.tensor(np.array(surface_mesh_to_bind.vertices)).float().to(nerfmodel.device)
             # verts_normals = torch.tensor(np.array(surface_mesh_to_bind.vertex_normals)).float().to(nerfmodel.device)
             self._vertex_colors = torch.tensor(np.array(surface_mesh_to_bind.vertex_colors)).float().to(nerfmodel.device)
@@ -219,16 +302,16 @@ class SuGaR(nn.Module):
             colors = faces_colors[:, None] * self.surface_triangle_bary_coords[None]  # n_faces, n_gaussians_per_face, 3, n_colors
             colors = colors.sum(dim=-2)  # n_faces, n_gaussians_per_face, n_colors
             colors = colors.reshape(-1, 3)  # n_faces * n_gaussians_per_face, n_colors
-                
+
             self._points = nn.Parameter(points, requires_grad=self.learn_positions).to(nerfmodel.device)
             n_points = len(np.array(surface_mesh_to_bind.triangles)) * n_gaussians_per_surface_triangle
             self._n_points = n_points
-            
+
         else:
             self.binded_to_surface_mesh = False
             self._points = nn.Parameter(points, requires_grad=self.learn_positions).to(nerfmodel.device)
             n_points = len(self._points)
-        
+
         # KNN information for training regularization
         self.keep_track_of_knn = keep_track_of_knn
         if keep_track_of_knn:
@@ -236,16 +319,16 @@ class SuGaR(nn.Module):
             knns = knn_points(points[None], points[None], K=knn_to_track)
             self.knn_dists = knns.dists[0]
             self.knn_idx = knns.idx[0]
-        
+
         # ---Tools for future meshing---
         # Primitive polygon that will be used to replace the gaussians
         self.primitive_types = primitive_types
         self._diamond_verts = torch.Tensor(
-                [[0., -1., 0.], [0., 0, 1.], 
+                [[0., -1., 0.], [0., 0, 1.],
                 [0., 1., 0.], [0., 0., -1.]]
                 ).to(nerfmodel.device)
         self._square_verts = torch.Tensor(
-                [[0., -1., 1.], [0., 1., 1.], 
+                [[0., -1., 1.], [0., 1., 1.],
                 [0., 1., -1.], [0., -1., -1.]]
                 ).to(nerfmodel.device)
         if primitive_types == 'diamond':
@@ -262,54 +345,58 @@ class SuGaR(nn.Module):
         self.n_triangles_per_gaussian = len(self.primitive_triangles)
         self.n_border_edges_per_gaussian = len(self.primitive_border_edges)
         self.triangle_scale = triangle_scale
-        
+
         # Texture info
         self._texture_initialized = False
         self.verts_uv, self.faces_uv = None, None
-        
+
         # Render parameters
-        self.image_height = int(nerfmodel.training_cameras.height[0].item())
-        self.image_width = int(nerfmodel.training_cameras.width[0].item())
-        self.focal_factor = max(nerfmodel.training_cameras.p3d_cameras.K[0, 0, 0].item(),
-                                nerfmodel.training_cameras.p3d_cameras.K[0, 1, 1].item())
-        
-        self.fx = nerfmodel.training_cameras.fx[0].item()
-        self.fy = nerfmodel.training_cameras.fy[0].item()
-        self.fov_x = focal2fov(self.fx, self.image_width)
-        self.fov_y = focal2fov(self.fy, self.image_height)
-        self.tanfovx = math.tan(self.fov_x * 0.5)
-        self.tanfovy = math.tan(self.fov_y * 0.5)
-        
+        self.image_height = int(nerfmodel.training_cameras.height[0])
+        self.image_width = int(nerfmodel.training_cameras.width[0])
+
+        # NOTE: seems do not used
+        # self.focal_factor = max(nerfmodel.training_cameras.p3d_cameras.K[0, 0, 0].item(),
+        #                         nerfmodel.training_cameras.p3d_cameras.K[0, 1, 1].item())
+
+        # self.fx = nerfmodel.training_cameras.fx[0].item()
+        # self.fy = nerfmodel.training_cameras.fy[0].item()
+        # self.fov_x = focal2fov(self.fx, self.image_width)
+        # self.fov_y = focal2fov(self.fy, self.image_height)
+        # self.tanfovx = math.tan(self.fov_x * 0.5)
+        # self.tanfovy = math.tan(self.fov_y * 0.5)
+
         if self.binded_to_surface_mesh and (not learn_surface_mesh_opacity):
             all_densities = inverse_sigmoid(0.9999 * torch.ones((n_points, 1), dtype=torch.float, device=points.device))
             self.learn_opacities = False
         else:
             all_densities = inverse_sigmoid(0.1 * torch.ones((n_points, 1), dtype=torch.float, device=points.device))
-        self.all_densities = nn.Parameter(all_densities, 
+        self.all_densities = nn.Parameter(all_densities,
                                      requires_grad=self.learn_opacities).to(nerfmodel.device)
         self.return_one_densities = False
-        
+
         self.min_ndc_radius = 2. / min(self.image_height, self.image_width)
         self.max_ndc_radius = 2. * 0.01  # 2. * 0.01
         self.min_radius = None # self.min_ndc_radius / self.focal_factor * 0.005  # 0.005
         self.max_radius = None # self.max_ndc_radius / self.focal_factor * 2.  # 2.
-        
+
         self.radius_dim = 7
-        
+
+        self.rotation_activation = torch.nn.functional.normalize
+
         # Initialize learnable radiuses
         if not self.binded_to_surface_mesh:
             self.scale_activation = scale_activation
             self.scale_inverse_activation = scale_inverse_activation
-            
+
             if initialize:
                 radiuses = _initialize_radiuses_gauss_rasterizer(self,)
                 print("Initialized radiuses for 3D Gauss Rasterizer")
-                
+
             else:
                 radiuses = torch.rand(1, n_points, self.radius_dim, device=nerfmodel.device)
-                self.min_radius = self.min_ndc_radius / self.focal_factor * 0.005 # 0.005
-                self.max_radius = self.max_ndc_radius / self.focal_factor * 2. # 2.
-                
+                # self.min_radius = self.min_ndc_radius / self.focal_factor * 0.005 # 0.005
+                # self.max_radius = self.max_ndc_radius / self.focal_factor * 2. # 2.
+
             # 3D Gaussian parameters
             self._scales = nn.Parameter(
                 radiuses[0, ..., 4:],
@@ -317,28 +404,28 @@ class SuGaR(nn.Module):
             self._quaternions = nn.Parameter(
                 radiuses[0, ..., :4],
                 requires_grad=self.learn_quaternions).to(nerfmodel.device)
-        
-        else:                        
+
+        else:
             self.scale_activation = scale_activation
             self.scale_inverse_activation = scale_inverse_activation
-            
+
             # First gather vertices of all triangles
             faces_verts = self._points[self._surface_mesh_faces.long()]  # n_faces, 3, n_coords
-            
+
             # Then, compute initial scales
             scales = (faces_verts - faces_verts[:, [1, 2, 0]]).norm(dim=-1).min(dim=-1)[0] * self.surface_triangle_circle_radius
             scales = scales.clamp_min(0.0000001).reshape(len(faces_verts), -1, 1).expand(-1, self.n_gaussians_per_surface_triangle, 2).clone().reshape(-1, 2)
             self._scales = nn.Parameter(
                 scale_inverse_activation(scales),
                 requires_grad=self.learn_surface_mesh_scales).to(nerfmodel.device)
-            
+
             # We actually don't learn quaternions here, but complex numbers to encode a 2D rotation in the triangle's plane
             complex_numbers = torch.zeros(self._n_points, 2).to(nerfmodel.device)
             complex_numbers[:, 0] = 1.
             self._quaternions = nn.Parameter(
                 complex_numbers,
                 requires_grad=self.learn_surface_mesh_scales).to(nerfmodel.device)
-        
+
         # Initialize color features
         self.sh_levels = sh_levels
         sh_coordinates_dc = RGB2SH(colors).unsqueeze(dim=1)
@@ -346,12 +433,12 @@ class SuGaR(nn.Module):
             sh_coordinates_dc.to(self.nerfmodel.device),
             requires_grad=True and (not freeze_gaussians)
         ).to(self.nerfmodel.device)
-        
+
         self._sh_coordinates_rest = nn.Parameter(
             torch.zeros(n_points, sh_levels**2 - 1, 3).to(self.nerfmodel.device),
             requires_grad=True and (not freeze_gaussians)
         ).to(self.nerfmodel.device)
-            
+
         # Beta mode
         self.beta_mode = beta_mode
         if beta_mode == 'learnable':
@@ -360,18 +447,21 @@ class SuGaR(nn.Module):
             self._log_beta = torch.nn.Parameter(
                 log_beta.to(self.nerfmodel.device),
                 ).to(self.nerfmodel.device)
-    
+
+        # syl: used in gaussian rast
+        self.normal_module = Depth2Normal()
+
     @property
     def device(self):
         return self.nerfmodel.device
-    
+
     @property
     def n_points(self):
         if not self.binded_to_surface_mesh:
             return len(self._points)
         else:
             return self._n_points
-    
+
     @property
     def points(self):
         if not self.binded_to_surface_mesh:
@@ -382,39 +472,51 @@ class SuGaR(nn.Module):
         else:
             # First gather vertices of all triangles
             faces_verts = self._points[self._surface_mesh_faces.long()]  # n_faces, 3, n_coords
-            
+
             # Then compute the points using barycenter coordinates in the surface triangles
             points = faces_verts[:, None] * self.surface_triangle_bary_coords[None]  # n_faces, n_gaussians_per_face, 3, n_coords
             points = points.sum(dim=-2)  # n_faces, n_gaussians_per_face, n_coords
-            
+
             return points.reshape(self._n_points, 3)  # n_faces * n_gaussians_per_face, n_coords
-    
+
     @property
     def strengths(self):
         if self.return_one_densities:
             return torch.ones_like(self.all_densities.view(-1, 1))
         else:
             return torch.sigmoid(self.all_densities.view(-1, 1))
-        
+
     @property
     def sh_coordinates(self):
         return torch.cat([self._sh_coordinates_dc, self._sh_coordinates_rest], dim=1)
-    
+
+    @property
+    def get_features(self):
+        color_clip = 2.0
+        features_dc = self._sh_coordinates_dc
+        features_dc = features_dc.clip(-color_clip, color_clip)
+        features_rest = self._sh_coordinates_rest
+        return torch.cat((features_dc, features_rest), dim=1)
+
     @property
     def radiuses(self):
         return torch.cat([self._quaternions, self._scales], dim=-1)[None]
-    
+
     @property
     def scaling(self):
         if not self.binded_to_surface_mesh:
             scales = self.scale_activation(self._scales)
         else:
             scales = torch.cat([
-                self.surface_mesh_thickness * torch.ones(len(self._scales), 1, device=self.device), 
+                self.surface_mesh_thickness * torch.ones(len(self._scales), 1, device=self.device),
                 self.scale_activation(self._scales)
                 ], dim=-1)
         return scales
-    
+
+    @property
+    def get_rotation(self):
+        return self.rotation_activation(self._quaternions)
+
     @property
     def quaternions(self):
         if not self.binded_to_surface_mesh:
@@ -429,7 +531,7 @@ class SuGaR(nn.Module):
 
             # We use the cross product for the last base axis
             base_R_2 = torch.nn.functional.normalize(torch.cross(R_0, base_R_1, dim=-1))
-            
+
             # We now apply the learned 2D rotation to the base quaternion
             complex_numbers = torch.nn.functional.normalize(self._quaternions, dim=-1).view(len(self._surface_mesh_faces), self.n_gaussians_per_surface_triangle, 2)
             R_1 = complex_numbers[..., 0:1] * base_R_1[:, None] + complex_numbers[..., 1:2] * base_R_2[:, None]
@@ -441,9 +543,9 @@ class SuGaR(nn.Module):
                         R_2[..., None]],
                         dim=-1).view(-1, 3, 3)
             quaternions = matrix_to_quaternion(R)
-            
+
         return torch.nn.functional.normalize(quaternions, dim=-1)
-    
+
     @property
     def triangle_vertices(self):
         # Apply shift to triangle vertices
@@ -454,115 +556,115 @@ class SuGaR(nn.Module):
         else:
             raise ValueError("Unknown primitive type: {}".format(self.primitive_types))
         triangle_vertices = self.primitive_verts[None]  # Shape: (1, n_vertices_per_gaussian, 3)
-        
+
         # Move canonical, shifted triangles to the local gaussian space
         # We need to permute the scaling axes so that the smallest is the first
         scale_argsort = self.scaling.argsort(dim=-1)
         scale_argsort[..., 1] = (scale_argsort[..., 0] + 1) % 3
         scale_argsort[..., 2] = (scale_argsort[..., 0] + 2) % 3
-        
+
         # TODO: Change for a lighter computation that does not require to compute the rotation matrices.
         # We can just permute the axes of triangle_vertices with the inverse permutation.
-        
+
         # Permute scales
         scale_sort = self.scaling.gather(dim=1, index=scale_argsort)
-        
+
         # Permute rotation axes
         rotation_matrices = quaternion_to_matrix(self.quaternions)
         rotation_sort = rotation_matrices.gather(dim=2, index=scale_argsort[..., None, :].expand(-1, 3, -1))
         quaternion_sort = matrix_to_quaternion(rotation_sort)
-        
+
         triangle_vertices = self.points.unsqueeze(1) + quaternion_apply(
             quaternion_sort.unsqueeze(1),
             triangle_vertices * self.triangle_scale * scale_sort.unsqueeze(1))
-        
+
         triangle_vertices = triangle_vertices.view(-1, 3)  # Shape: (n_pts * n_vertices_per_gaussian, 3)
         return triangle_vertices
-    
+
     @property
     def triangle_border_edges(self):
         edges = self.primitive_border_edges[None]  # Shape: (1, n_border_edges_per_gaussian, 2)
         edges = edges + 4 * torch.arange(len(self.points), device=self.device)[:, None, None]  # Shape: (n_pts, n_border_edges_per_gaussian, 2)
         edges = edges.view(-1, 2)  # Shape: (n_pts * n_border_edges_per_gaussian, 2)
         return edges
-    
+
     @property
     def triangles(self):
         triangles = self.primitive_triangles[None].expand(self.n_points, -1, -1).clone()  # Shape: (n_pts, n_triangles_per_gaussian, 3)
         triangles = triangles + 4 * torch.arange(len(self.points), device=self.device)[:, None, None]  # Shape: (n_pts, n_triangles_per_gaussian, 3)
         triangles = triangles.view(-1, 3)  # Shape: (n_pts * n_triangles_per_gaussian, 3)
         return triangles
-    
+
     @property
     def texture_features(self):
         if not self._texture_initialized:
             self.update_texture_features()
         return self.sh_coordinates[self.point_idx_per_pixel.long()]
-    
+
     @property
-    def mesh(self):        
+    def mesh(self):
         textures_uv = TexturesUV(
             maps=SH2RGB(self.texture_features[..., 0, :][None]), #texture_img[None]),
             verts_uvs=self.verts_uv[None],
             faces_uvs=self.faces_uv[None],
             sampling_mode='nearest',
             )
-        
+
         return Meshes(
-            verts=[self.triangle_vertices],   
+            verts=[self.triangle_vertices],
             faces=[self.triangles],
             textures=textures_uv,
         )
-        
+
     @property
     def surface_mesh(self):
         # Create a Meshes object
         surface_mesh = Meshes(
-            verts=[self._points.to(self.device)],   
+            verts=[self._points.to(self.device)],
             faces=[self._surface_mesh_faces.to(self.device)],
             textures=TexturesVertex(verts_features=self._vertex_colors[None].clamp(0, 1).to(self.device)),
             # verts_normals=[verts_normals.to(rc.device)],
             )
         return surface_mesh
-    
+
     def unbind_surface_mesh(self):
         self._quaternions = nn.Parameter(self.quaternions.detach(), requires_grad=self.learn_quaternions).to(self.nerfmodel.device)
         self._scales = nn.Parameter(scale_inverse_activation(self.scaling.detach()), requires_grad=self.learn_scales).to(self.nerfmodel.device)
         self.scale_activation = scale_activation
         self.scale_inverse_activation = scale_inverse_activation
         self.binded_to_surface_mesh = False
-            
-    def get_filtered_mesh(self, gaussian_mask):        
+
+    def get_filtered_mesh(self, gaussian_mask):
         new_verts = self.triangle_vertices.clone()#.reshape(-1, self.n_vertices_per_gaussian, 3)
         verts_mask = gaussian_mask[:, None].expand(-1, self.n_vertices_per_gaussian).reshape(-1)
         new_verts[~verts_mask] = self.points.abs().max() * 5.
         new_verts = new_verts#.reshape(-1, 3)
-        
+
         textures_uv = TexturesUV(
             maps=SH2RGB(self.texture_features[..., 0, :][None]), #texture_img[None]),
             verts_uvs=self.verts_uv[None],
             faces_uvs=self.faces_uv[None],
             sampling_mode='nearest',
             )
-        
+
         return Meshes(
-            verts=[new_verts],   
+            verts=[new_verts],
             faces=[self.triangles],
             textures=textures_uv,
         )
-        
-    def splat_mesh(self, p3d_camera, 
+
+    def splat_mesh(self, p3d_camera,
                    mode='perspective'  # 'depth' or 'perspective'
                    ):
         new_verts = self.triangle_vertices.clone().reshape(-1, self.n_vertices_per_gaussian, 3)  # Shape (n_points, n_vertices_per_gaussian, 3)
         camera_center = p3d_camera.get_camera_center().view(1, 1, 3)  # Shape (1, 1, 3)
         gaussian_centers = self.points.view(-1, 1, 3)  # Shape (n_points, 1, 3)
-        
+
         n_gaussians = len(gaussian_centers)
-        
+
         new_verts_in_camera_space = p3d_camera.get_world_to_view_transform().transform_points(new_verts.view(-1, 3)).reshape(n_gaussians, -1, 3)  # Shape (n_points, n_vertices_per_gaussian, 3)
         gaussian_centers_in_camera_space = p3d_camera.get_world_to_view_transform().transform_points(gaussian_centers.view(-1, 3)).reshape(n_gaussians, -1, 3)  # Shape (n_points, 1, 3)
-        
+
         if mode == 'depth':
             new_verts_in_camera_space[..., 2] = gaussian_centers_in_camera_space[..., 2]
         else:
@@ -570,22 +672,22 @@ class SuGaR(nn.Module):
             verts_projection = (new_verts_in_camera_space * proj_dir).sum(-1, keepdim=True)  # Shape (n_points, n_vertices_per_gaussian, 1)
             centers_projection = (gaussian_centers_in_camera_space * proj_dir).sum(-1, keepdim=True)  # Shape (n_points, 1, 1)
             new_verts_in_camera_space = (centers_projection / verts_projection) * new_verts_in_camera_space
-        
+
         splatted_verts = p3d_camera.get_world_to_view_transform().inverse().transform_points(new_verts_in_camera_space.reshape(-1, 3))
-        
+
         textures_uv = TexturesUV(
             maps=SH2RGB(self.texture_features[..., 0, :][None]), #texture_img[None]),
             verts_uvs=self.verts_uv[None],
             faces_uvs=self.faces_uv[None],
             sampling_mode='nearest',
             )
-        
+
         return Meshes(
-            verts=[splatted_verts],   
+            verts=[splatted_verts],
             faces=[self.triangles],
             textures=textures_uv,
         )
-        
+
     def get_covariance(self, return_full_matrix=False, return_sqrt=False, inverse_scales=False, scaling_factor=None, enlarge_minaxis=None):
         if scaling_factor is None:
             scaling = self.scaling
@@ -609,11 +711,11 @@ class SuGaR(nn.Module):
         scaled_rotation = quaternion_to_matrix(self.quaternions) * scaling[:, None]
         if return_sqrt:
             return scaled_rotation
-        
+
         cov3Dmatrix = scaled_rotation @ scaled_rotation.transpose(-1, -2)
         if return_full_matrix:
             return cov3Dmatrix
-        
+
         cov3D = torch.zeros((cov3Dmatrix.shape[0], 6), dtype=torch.float, device=self.device)
         cov3D[:, 0] = cov3Dmatrix[:, 0, 0]
         cov3D[:, 1] = cov3Dmatrix[:, 0, 1]
@@ -621,13 +723,13 @@ class SuGaR(nn.Module):
         cov3D[:, 3] = cov3Dmatrix[:, 1, 1]
         cov3D[:, 4] = cov3Dmatrix[:, 1, 2]
         cov3D[:, 5] = cov3Dmatrix[:, 2, 2]
-        
+
         return cov3D
-        
+
     def update_texture_features(self, square_size_in_texture=2):
         features = self.sh_coordinates.view(len(self.points), -1)
         faces_uv, verts_uv, texture_img, point_idx_per_pixel = _convert_vertex_colors_to_texture(
-            self, 
+            self,
             features,
             square_size=square_size_in_texture,
             )
@@ -638,31 +740,31 @@ class SuGaR(nn.Module):
 
         self.point_idx_per_pixel = torch.nn.Parameter(point_idx_per_pixel, requires_grad=False)
         self._texture_initialized = True
-        
+
     def get_texture_img(self, nerf_cameras, cam_idx, sh_levels:int=None,):
         if nerf_cameras is None:
             nerf_cameras = self.nerfmodel.training_cameras
         if sh_levels is None:
             sh_levels = self.sh_levels
-        
+
         cameras = nerf_cameras.p3d_cameras[cam_idx]
-        
+
         # Compute directions
         directions = torch.nn.functional.normalize(
             self.points[self.point_idx_per_pixel.long()].reshape(-1, 3) - cameras.get_camera_center().view(1, 3),
             dim=-1)
-        
+
         # Gather sh coordinates
         sh_coordinates = self.texture_features.reshape(len(directions), -1, 3)[:, :sh_levels**2, :]
-        
+
         # Compute texture from sh coordinates
         shs_view = sh_coordinates.transpose(-1, -2).view(-1, 3, sh_levels**2)
         sh2rgb = eval_sh(sh_levels-1, shs_view, directions)
         directional_texture = torch.clamp_min(sh2rgb + 0.5, 0.0).view(-1, 3)
         directional_texture = directional_texture.view(self.texture_size, self.texture_size, 3)
-            
+
         return directional_texture
-    
+
     def prune_points(self, prune_mask):
         print("WARNING! During optimization, you should use a densifier to prune low opacity points.")
         print("This function does not preserve the state of an optimizer, and sets requires_grad=False to all parameters.")
@@ -672,45 +774,47 @@ class SuGaR(nn.Module):
         self._sh_coordinates_dc = torch.nn.Parameter(self._sh_coordinates_dc[prune_mask].detach(), requires_grad=False)
         self._sh_coordinates_rest = torch.nn.Parameter(self._sh_coordinates_rest[prune_mask].detach(), requires_grad=False)
         self.all_densities = torch.nn.Parameter(self.all_densities[prune_mask].detach(), requires_grad=False)
-        
+
     def drop_low_opacity_points(self, opacity_threshold=0.5):
         mask = self.strengths[..., 0] > opacity_threshold  # 1e-3, 0.5
         self.prune_points(mask)
-        
+
     def forward(self, **kwargs):
         pass
-    
+
     def adapt_to_cameras(self, cameras:CamerasWrapper):
         self.focal_factor = max(cameras.p3d_cameras.K[0, 0, 0].item(),
                                 cameras.p3d_cameras.K[0, 1, 1].item())
-        
+
         self.image_height = int(cameras.height[0].item())
         self.image_width = int(cameras.width[0].item())
-        
+
         self.min_ndc_radius = 2. / min(self.image_height, self.image_width)
         self.max_ndc_radius = 2. * 0.01
-        
+
         self.fx = cameras.fx[0].item()
         self.fy = cameras.fy[0].item()
         self.fov_x = focal2fov(self.fx, self.image_width)
         self.fov_y = focal2fov(self.fy, self.image_height)
         self.tanfovx = math.tan(self.fov_x * 0.5)
         self.tanfovy = math.tan(self.fov_y * 0.5)
-        
-    def get_cameras_spatial_extent(self, nerf_cameras:CamerasWrapper=None, return_average_xyz=False):
-        if nerf_cameras is None:
-            nerf_cameras = self.nerfmodel.training_cameras
-        
-        camera_centers = nerf_cameras.p3d_cameras.get_camera_center()
-        avg_camera_center = camera_centers.mean(dim=0, keepdim=True)
-        half_diagonal = torch.norm(camera_centers - avg_camera_center, dim=-1).max().item()
 
-        radius = 1.1 * half_diagonal
-        if return_average_xyz:
-            return radius, avg_camera_center
-        else:
-            return radius
-        
+    def get_cameras_spatial_extent(self, nerf_cameras:CamerasWrapper=None, return_average_xyz=False):
+
+        return self.nerfmodel.camera_radius
+        # if nerf_cameras is None:
+        #     nerf_cameras = self.nerfmodel.training_cameras
+        #
+        # camera_centers = nerf_cameras.p3d_cameras.get_camera_center()
+        # avg_camera_center = camera_centers.mean(dim=0, keepdim=True)
+        # half_diagonal = torch.norm(camera_centers - avg_camera_center, dim=-1).max().item()
+        #
+        # radius = 1.1 * half_diagonal
+        # if return_average_xyz:
+        #     return radius, avg_camera_center
+        # else:
+        #     return radius
+
     def get_points_rgb(
         self,
         positions:torch.Tensor=None,
@@ -732,7 +836,7 @@ class SuGaR(nn.Module):
         Returns:
             _type_: _description_
         """
-            
+
         if positions is None:
             positions = self.points
 
@@ -745,7 +849,7 @@ class SuGaR(nn.Module):
 
         if sh_coordinates is None:
             sh_coordinates = self.sh_coordinates
-            
+
         if sh_levels is None:
             sh_coordinates = sh_coordinates
         else:
@@ -754,9 +858,9 @@ class SuGaR(nn.Module):
         shs_view = sh_coordinates.transpose(-1, -2).view(-1, 3, sh_levels**2)
         sh2rgb = eval_sh(sh_levels-1, shs_view, render_directions)
         colors = torch.clamp_min(sh2rgb + 0.5, 0.0).view(-1, 3)
-        
+
         return colors
-    
+
     def sample_points_in_gaussians(self, num_samples, sampling_scale_factor=1., mask=None,
                                    probabilities_proportional_to_opacity=False,
                                    probabilities_proportional_to_volume=True,):
@@ -776,12 +880,12 @@ class SuGaR(nn.Module):
             scaling = self.scaling
         else:
             scaling = self.scaling[mask]
-        
+
         if probabilities_proportional_to_volume:
             areas = scaling[..., 0] * scaling[..., 1] * scaling[..., 2]
         else:
             areas = torch.ones_like(scaling[..., 0])
-        
+
         if probabilities_proportional_to_opacity:
             if mask is None:
                 areas = areas * self.strengths.view(-1)
@@ -789,18 +893,18 @@ class SuGaR(nn.Module):
                 areas = areas * self.strengths[mask].view(-1)
         areas = areas.abs()
         cum_probs = areas.cumsum(dim=-1) / areas.sum(dim=-1, keepdim=True)
-        
+
         random_indices = torch.multinomial(cum_probs, num_samples=num_samples, replacement=True)
         if mask is not None:
             valid_indices = torch.arange(self.n_points, device=self.device)[mask]
             random_indices = valid_indices[random_indices]
-        
+
         random_points = self.points[random_indices] + quaternion_apply(
-            self.quaternions[random_indices], 
+            self.quaternions[random_indices],
             sampling_scale_factor * self.scaling[random_indices] * torch.randn_like(self.points[random_indices]))
-        
+
         return random_points, random_indices
-    
+
     def get_smallest_axis(self, return_idx=False):
         """Returns the smallest axis of the Gaussians.
 
@@ -816,7 +920,7 @@ class SuGaR(nn.Module):
         if return_idx:
             return smallest_axis.squeeze(dim=2), smallest_axis_idx[..., 0, 0]
         return smallest_axis.squeeze(dim=2)
-    
+
     def get_normals(self, estimate_from_points=False, neighborhood_size:int=32):
         """Returns the normals of the Gaussians.
 
@@ -829,7 +933,7 @@ class SuGaR(nn.Module):
         """
         if estimate_from_points:
             normals = estimate_pointcloud_normals(
-                self.points[None], #.detach(), 
+                self.points[None], #.detach(),
                 neighborhood_size=neighborhood_size,
                 disambiguate_directions=True
                 )[0]
@@ -840,14 +944,14 @@ class SuGaR(nn.Module):
             else:
                 normals = self.get_smallest_axis()
         return normals
-    
+
     def get_neighbors_of_random_points(self, num_samples):
         if num_samples >= 0:
-            sampleidx = torch.randperm(len(self.points), device=self.device)[:num_samples]        
+            sampleidx = torch.randperm(len(self.points), device=self.device)[:num_samples]
             return self.knn_idx[sampleidx]
         else:
             return self.knn_idx
-    
+
     def get_local_variance(self, values:torch.Tensor, neighbor_idx:torch.Tensor):
         """_summary_
 
@@ -857,11 +961,11 @@ class SuGaR(nn.Module):
         """
         neighbor_values = values[neighbor_idx]  # Shape is (n_points, n_neighbors, n_values)
         return (neighbor_values - neighbor_values.mean(dim=1, keepdim=True)).pow(2).sum(dim=-1).mean(dim=1)
-    
+
     def get_local_distance2(
-        self, 
-        values:torch.Tensor, 
-        neighbor_idx:torch.Tensor, 
+        self,
+        values:torch.Tensor,
+        neighbor_idx:torch.Tensor,
         weights:torch.Tensor=None,
         ):
         """_summary_
@@ -874,16 +978,16 @@ class SuGaR(nn.Module):
         Returns:
             _type_: _description_
         """
-        
+
         neighbor_values = values[neighbor_idx]  # Shape is (n_points, n_neighbors, n_values)
         distance2 = neighbor_values[:, 1:] - neighbor_values[:, :1]  # Shape is (n_points, n_neighbors-1, n_values)
         distance2 = distance2.pow(2).sum(dim=-1)  # Shape is (n_points, n_neighbors-1)
-        
+
         if weights is not None:
             distance2 = distance2 * weights
 
         return distance2.mean(dim=1)  # Shape is (n_points,)
-    
+
     def reset_neighbors(self, knn_to_track:int=None):
         if self.binded_to_surface_mesh:
             print("WARNING! You should not reset the neighbors of a surface mesh.")
@@ -895,46 +999,46 @@ class SuGaR(nn.Module):
                 self.knn_to_track = knn_to_track
             else:
                 if knn_to_track is None:
-                    knn_to_track = self.knn_to_track 
-            # Compute KNN               
+                    knn_to_track = self.knn_to_track
+            # Compute KNN
             with torch.no_grad():
                 self.knn_to_track = knn_to_track
                 knns = knn_points(self.points[None], self.points[None], K=knn_to_track)
                 self.knn_dists = knns.dists[0]
                 self.knn_idx = knns.idx[0]
-            
-    def get_edge_neighbors(self, k_neighbors, 
+
+    def get_edge_neighbors(self, k_neighbors,
                            edges=None, triangle_vertices=None,):
         if edges is None:
             edges = self.triangle_border_edges
         if triangle_vertices is None:
             triangle_vertices = self.triangle_vertices
-        
+
         # We select the closest edges based on the position of the edge center
         edge_centers = triangle_vertices[edges].mean(dim=-2)
-        
+
         # TODO: Compute only for vertices with high opacity? Remove points with low opacity?
         edge_knn = knn_points(edge_centers[None], edge_centers[None], K=8)
         edge_knn_idx = edge_knn.idx[0]
-        
+
         return edge_knn_idx
-            
+
     def compute_gaussian_overlap_with_neighbors(
-        self, 
+        self,
         neighbor_idx,
         use_gaussian_center_only=True,
         n_samples_to_compute_overlap=32,
         weight_by_normal_angle=False,
         propagate_gradient_to_points_only=False,
         ):
-        
+
         # This is used to skip the first neighbor, which is the point itself
         neighbor_start_idx = 1
-        
+
         # Get sampled points
         point_idx = neighbor_idx[:, 0]  # (n_points, )
         n_points = len(point_idx)
-        
+
         # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
         if propagate_gradient_to_points_only:
             scaling = self.scaling.detach()
@@ -942,48 +1046,48 @@ class SuGaR(nn.Module):
         else:
             scaling = self.scaling
             quaternions = self.quaternions
-        
+
         # Samples points in the corresponding gaussians
         if use_gaussian_center_only:
             n_samples_to_compute_overlap = 1
             gaussian_samples = self.points[point_idx].unsqueeze(1) + 0.  # (n_points, n_samples_to_compute_overlap, 3)
         else:
             gaussian_samples = self.points[point_idx].unsqueeze(1) + quaternion_apply(
-                quaternions[point_idx].unsqueeze(1), 
+                quaternions[point_idx].unsqueeze(1),
                 scaling[point_idx].unsqueeze(1) * torch.randn(
-                    n_points, n_samples_to_compute_overlap, 3, 
+                    n_points, n_samples_to_compute_overlap, 3,
                     device=self.device)
                 )  # (n_points, n_samples_to_compute_overlap, 3)
-        
+
         # >>> We will now compute the gaussian weight of all samples, for each neighbor gaussian.
         # We start by computing the shift between the samples and the neighbor gaussian centers.
         neighbor_center_to_samples = gaussian_samples.unsqueeze(1) - self.points[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
-        
-        # We compute the inverse of the scaling of the neighbor gaussians. 
-        # For 2D gaussians, we implictly project the samples on the plane of each gaussian; 
+
+        # We compute the inverse of the scaling of the neighbor gaussians.
+        # For 2D gaussians, we implictly project the samples on the plane of each gaussian;
         # We do so by setting the inverse of the scaling of the gaussian to 0 in the direction of the gaussian normal (i.e. 0-axis).
         inverse_scales = 1. / scaling[neighbor_idx[:, neighbor_start_idx:]].unsqueeze(2)  # (n_points, n_neighbors-1, 1, 3)
-        
+
         # We compute the "gaussian distance" of all samples to the neighbor gaussians, i.e. the norm of the unrotated shift,
         # weighted by the inverse of the scaling of the neighbor gaussians.
         gaussian_distances = inverse_scales * quaternion_apply(
-            quaternion_invert(quaternions[neighbor_idx[:, neighbor_start_idx:]]).unsqueeze(2), 
+            quaternion_invert(quaternions[neighbor_idx[:, neighbor_start_idx:]]).unsqueeze(2),
             neighbor_center_to_samples
             )  # (n_points, n_neighbors-1, n_samples_to_compute_overlap, 3)
-        
+
         # Now we can compute the gaussian weights of all samples, for each neighbor gaussian.
         # We then sum them to get the gaussian overlap of each neighbor gaussian.
         gaussian_weights = torch.exp(-1./2. * (gaussian_distances ** 2).sum(dim=-1))  # (n_points, n_neighbors-1, n_samples_to_compute_overlap)
         gaussian_overlaps = gaussian_weights.mean(dim=-1)  # (n_points, n_neighbors-1)
-        
+
         # If needed, we weight the gaussian overlaps by the angle between the normal of the neighbor gaussian and the normal of the point gaussian
         if weight_by_normal_angle:
             normals = self.get_normals()[neighbor_idx]  # (n_points, n_neighbors, 3)
             weights = (normals[:, 1:] * normals[:, 0:1]).sum(dim=-1).abs()  # (n_points, n_neighbors-1)
             gaussian_overlaps = gaussian_overlaps * weights
-            
+
         return gaussian_overlaps
-    
+
     def compute_gaussian_alignment_with_neighbors(
         self,
         neighbor_idx,
@@ -991,14 +1095,14 @@ class SuGaR(nn.Module):
         propagate_gradient_to_points_only=False,
         std_factor = 1.,
         ):
-        
+
         # This is used to skip the first neighbor, which is the point itself
         neighbor_start_idx = 1
-        
+
         # Get sampled points
         point_idx = neighbor_idx[:, 0]  # (n_points, )
         n_points = len(point_idx)
-        
+
         # Decide whether we want to propagate the gradient to the points only, or to the points and the covariance parameters
         if propagate_gradient_to_points_only:
             scaling = self.scaling.detach()
@@ -1006,45 +1110,45 @@ class SuGaR(nn.Module):
         else:
             scaling = self.scaling
             quaternions = self.quaternions
-        
+
         # We compute scaling, inverse quaternions and centers for all gaussians and their neighbors
         all_scaling = scaling[neighbor_idx]
         all_invert_quaternions = quaternion_invert(quaternions)[neighbor_idx]
         all_centers = self.points[neighbor_idx]
-        
+
         # We compute direction vectors between the gaussians and their neighbors
         neighbor_shifts = all_centers[:, neighbor_start_idx:] - all_centers[:, :neighbor_start_idx]
         neighbor_distances = neighbor_shifts.norm(dim=-1).clamp(min=1e-8)
         neighbor_directions = neighbor_shifts / neighbor_distances.unsqueeze(-1)
-        
+
         # We compute the standard deviations of the gaussians in the direction of their neighbors,
         # and reciprocally in the direction of the gaussians.
         standard_deviations_gaussians = (
             all_scaling[:, 0:neighbor_start_idx]
-            * quaternion_apply(all_invert_quaternions[:, 0:neighbor_start_idx], 
+            * quaternion_apply(all_invert_quaternions[:, 0:neighbor_start_idx],
                                neighbor_directions)
             ).norm(dim=-1)
-        
+
         standard_deviations_neighbors = (
             all_scaling[:, neighbor_start_idx:]
-            * quaternion_apply(all_invert_quaternions[:, neighbor_start_idx:], 
+            * quaternion_apply(all_invert_quaternions[:, neighbor_start_idx:],
                                neighbor_directions)
             ).norm(dim=-1)
-        
+
         # The distance between the gaussians and their neighbors should be the sum of their standard deviations (up to a factor)
         stabilized_distance = (standard_deviations_gaussians + standard_deviations_neighbors) * std_factor
         gaussian_alignment = (neighbor_distances / stabilized_distance.clamp(min=1e-8) - 1.).abs()
-        
+
         # If needed, we weight the gaussian alignments by the angle between the normal of the neighbor gaussian and the normal of the point gaussian
         if weight_by_normal_angle:
             normals = self.get_normals()[neighbor_idx]  # (n_points, n_neighbors, 3)
             weights = (normals[:, 1:] * normals[:, 0:1]).sum(dim=-1).abs()  # (n_points, n_neighbors-1)
             gaussian_alignment = gaussian_alignment * weights
-            
+
         return gaussian_alignment
-    
-    def get_beta(self, x, 
-                 closest_gaussians_idx=None, 
+
+    def get_beta(self, x,
+                 closest_gaussians_idx=None,
                  closest_gaussians_opacities=None,
                  densities=None,
                  opacity_min_clamp=1e-32,):
@@ -1062,20 +1166,20 @@ class SuGaR(nn.Module):
         """
         if self.beta_mode == 'learnable':
             return torch.exp(self._log_beta).expand(len(x))
-        
+
         elif self.beta_mode == 'average':
             if closest_gaussians_idx is None:
                 raise ValueError("closest_gaussians_idx must be provided when using beta_mode='average'.")
             return self.scaling.min(dim=-1)[0][closest_gaussians_idx].mean(dim=1)
-        
+
         elif self.beta_mode == 'weighted_average':
             if closest_gaussians_idx is None:
                 raise ValueError("closest_gaussians_idx must be provided when using beta_mode='weighted_average'.")
             if closest_gaussians_opacities is None:
                 raise ValueError("closest_gaussians_opacities must be provided when using beta_mode='weighted_average'.")
-            
+
             min_scaling = self.scaling.min(dim=-1)[0][closest_gaussians_idx]
-            
+
             # if densities is None:
             if True:
                 opacities_sum = closest_gaussians_opacities.sum(dim=-1, keepdim=True)
@@ -1095,13 +1199,13 @@ class SuGaR(nn.Module):
                 one_at_closest_gaussian[0, 0] = 1.
                 weights[opacities_sum[..., 0] == 0.] = one_at_closest_gaussian
                 beta = (rc.scaling.min(dim=-1)[0][closest_gaussians_idx] * weights).sum(dim=1)
-            
+
             # Method 2: Give the maximum scaling value in neighbors as beta (Not good if neighbors have low scaling)
             if False:
                 beta = (min_scaling * weights).sum(dim=-1)
                 mask = opacities_sum[..., 0] == 0.
                 beta[mask] = min_scaling.max(dim=-1)[0][mask]
-            
+
             # Method 3: Give a constant, large beta value (better control)
             if True:
                 beta = (min_scaling * weights).sum(dim=-1)
@@ -1112,16 +1216,16 @@ class SuGaR(nn.Module):
                     else:
                         # Option 2: beta = largest min_scale in the scene
                         beta[opacities_sum[..., 0] == 0.] = min_scaling.max().detach()
-            
+
             return beta
-        
+
         else:
             raise ValueError("Unknown beta_mode.")
-    
-    def get_field_values(self, x, gaussian_idx=None, 
+
+    def get_field_values(self, x, gaussian_idx=None,
                     closest_gaussians_idx=None,
-                    gaussian_strengths=None, 
-                    gaussian_centers=None, 
+                    gaussian_strengths=None,
+                    gaussian_centers=None,
                     gaussian_inv_scaled_rotation=None,
                     return_sdf=True, density_threshold=1., density_factor=1.,
                     return_sdf_grad=False, sdf_grad_max_value=10.,
@@ -1134,15 +1238,15 @@ class SuGaR(nn.Module):
             gaussian_centers = self.points
         if gaussian_inv_scaled_rotation is None:
             gaussian_inv_scaled_rotation = self.get_covariance(return_full_matrix=True, return_sqrt=True, inverse_scales=True)
-        
+
         if closest_gaussians_idx is None:
             closest_gaussians_idx = self.knn_idx[gaussian_idx]
         closest_gaussian_centers = gaussian_centers[closest_gaussians_idx]
         closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[closest_gaussians_idx]
         closest_gaussian_strengths = gaussian_strengths[closest_gaussians_idx]
-        
+
         fields = {}
-        
+
         # Compute the density field as a sum of local gaussian opacities
         # TODO: Change the normalization of the density (maybe learn the scaling parameter?)
         shift = (x[:, None] - closest_gaussian_centers)
@@ -1153,17 +1257,17 @@ class SuGaR(nn.Module):
         fields['density'] = densities.clone()
         density_mask = densities >= 1.
         densities[density_mask] = densities[density_mask] / (densities[density_mask].detach() + 1e-12)
-        
+
         if return_closest_gaussian_opacities:
             fields['closest_gaussian_opacities'] = neighbor_opacities
-        
+
         if return_sdf or return_sdf_grad or return_beta:
             # --- Old way
             # beta = self.scaling.min(dim=-1)[0][closest_gaussians_idx].mean(dim=1)
             # ---New way
-            beta = self.get_beta(x, 
-                                 closest_gaussians_idx=closest_gaussians_idx, 
-                                 closest_gaussians_opacities=neighbor_opacities, 
+            beta = self.get_beta(x,
+                                 closest_gaussians_idx=closest_gaussians_idx,
+                                 closest_gaussians_opacities=neighbor_opacities,
                                  densities=densities,
                                  opacity_min_clamp=opacity_min_clamp,
                                  )
@@ -1171,7 +1275,7 @@ class SuGaR(nn.Module):
 
         if return_beta:
             fields['beta'] = beta
-        
+
         # Compute the signed distance field
         if return_sdf:
             sdf_values = beta * (
@@ -1179,16 +1283,16 @@ class SuGaR(nn.Module):
                 - np.sqrt(-2. * np.log(min(density_threshold, 1.)))
                 )
             fields['sdf'] = sdf_values
-            
+
         # Compute the gradient of the signed distance field
         if return_sdf_grad:
             sdf_grad = neighbor_opacities[..., None] * (closest_gaussian_inv_scaled_rotation @ warped_shift)[..., 0]
             sdf_grad = sdf_grad.sum(dim=-2)
             sdf_grad = (beta / (clamped_densities * torch.sqrt(-2. * torch.log(clamped_densities))).clamp(min=opacity_min_clamp))[..., None] * sdf_grad
             fields['sdf_grad'] = sdf_grad.clamp(min=-sdf_grad_max_value, max=sdf_grad_max_value)
-            
+
         return fields
-    
+
     def get_points_depth_in_depth_map(self, fov_camera, depth, points_in_camera_space):
         depth_view = depth.unsqueeze(0).unsqueeze(-1).permute(0, 3, 1, 2)
         pts_projections = fov_camera.get_projection_transform().transform_points(points_in_camera_space)
@@ -1205,42 +1309,42 @@ class SuGaR(nn.Module):
                                                 padding_mode='border'  # 'reflection', 'zeros'
                                                 )[0, 0, :, 0]
         return map_z
-    
+
     def get_gaussians_closest_to_samples(self, x, n_closest_gaussian=None):
         if n_closest_gaussian is None:
             if not hasattr(self, 'knn_to_track'):
                 print("Variable knn_to_track not found. Setting it to 16.")
                 self.knn_to_track = 16
             n_closest_gaussian = self.knn_to_track
-        
+
         closest_gaussians_idx = knn_points(x[None], self.points[None], K=n_closest_gaussian).idx[0]
         return closest_gaussians_idx
-    
-    def compute_density(self, x, closest_gaussians_idx=None, density_factor=1., 
+
+    def compute_density(self, x, closest_gaussians_idx=None, density_factor=1.,
                         return_closest_gaussian_opacities=False):
-        
+
         if closest_gaussians_idx is None:
             closest_gaussians_idx = self.get_gaussians_closest_to_samples(x)
-        
+
         # Gather gaussian parameters
         close_gaussian_centers = self.points[closest_gaussians_idx]
         close_gaussian_inv_scaled_rotation = self.get_covariance(
             return_full_matrix=True, return_sqrt=True, inverse_scales=True
             )[closest_gaussians_idx]
         close_gaussian_strengths = self.strengths[closest_gaussians_idx]
-        
+
         # Compute the density field as a sum of local gaussian opacities
         shift = (x[:, None] - close_gaussian_centers)
         warped_shift = close_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
         neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
         neighbor_opacities = density_factor * close_gaussian_strengths[..., 0] * torch.exp(-1. / 2 * neighbor_opacities)
         densities = neighbor_opacities.sum(dim=-1)
-        
+
         if return_closest_gaussian_opacities:
             return densities, neighbor_opacities
         else:
             return densities  # Shape is (n_points, )
-        
+
     def get_signed_normals(self, gaussian_idx, gaussian_sign_encodings):
         """_summary_
 
@@ -1252,7 +1356,7 @@ class SuGaR(nn.Module):
             _type_: _description_
         """
         n_sh = gaussian_sign_encodings.shape[-2]
-        
+
         normals = self.get_normals()[gaussian_idx]
         quaternions = self.quaternions[gaussian_idx]
         normal_signs = 2. * eval_sh(
@@ -1260,11 +1364,11 @@ class SuGaR(nn.Module):
             sh=gaussian_sign_encodings.transpose(-1, -2).view(-1, 1, n_sh),
             dirs=quaternion_apply(quaternion_invert(quaternions), normals).view(-1, 3)
         )
-        
+
         return torch.nn.functional.normalize(normal_signs * normals, dim=-1)
-    
+
     def compute_level_surface_points_from_camera(
-        self, 
+        self,
         nerf_cameras=None,
         cam_idx=0,
         rasterizer=None,
@@ -1288,34 +1392,34 @@ class SuGaR(nn.Module):
         # Remember to reset neighbors and update texture features before calling this function
         if nerf_cameras is None:
             nerf_cameras = self.nerfmodel.training_cameras
-        
+
         if primitive_types is not None:
             self.primitive_types = primitive_types
-            
+
         if triangle_scale is not None:
             self.triangle_scale = triangle_scale
-            
+
         if rasterizer is None:
             faces_per_pixel = 10
             max_faces_per_bin = 50_000
 
             mesh_raster_settings = RasterizationSettings(
                 image_size=(self.image_height, self.image_width),
-                blur_radius=0.0, 
+                blur_radius=0.0,
                 faces_per_pixel=faces_per_pixel,
                 max_faces_per_bin=max_faces_per_bin
             )
             rasterizer = MeshRasterizer(
-                    cameras=nerf_cameras.p3d_cameras[cam_idx], 
+                    cameras=nerf_cameras.p3d_cameras[cam_idx],
                     raster_settings=mesh_raster_settings,
                 )
-            
+
         p3d_cameras = nerf_cameras.p3d_cameras[cam_idx]
-        
+
         # Compute splatted depth
         if use_gaussian_depth:
             point_depth = p3d_cameras.get_world_to_view_transform().transform_points(self.points)[..., 2:].expand(-1, 3)
-            depth = self.render_image_gaussian_rasterizer( 
+            depth = self.render_image_gaussian_rasterizer(
                     camera_indices=cam_idx,
                     bg_color=torch.Tensor([-1., -1., -1.]).to(self.device),
                     sh_deg=0,
@@ -1329,7 +1433,7 @@ class SuGaR(nn.Module):
         else:
             if True:
                 textures_img = self.get_texture_img(
-                    nerf_cameras=nerf_cameras, 
+                    nerf_cameras=nerf_cameras,
                     cam_idx=cam_idx,
                     sh_levels=self.sh_levels,
                     )
@@ -1345,7 +1449,7 @@ class SuGaR(nn.Module):
             depth = fragments.zbuf[0, ..., 0]
             no_depth_mask = depth < 0.
             depth[no_depth_mask] = depth.max() * 1.05
-        
+
         # We backproject the points in world space
         batch_size = 1
         x_tab = torch.Tensor([[i for j in range(self.image_width)] for i in range(self.image_height)]).to(self.device)
@@ -1365,7 +1469,7 @@ class SuGaR(nn.Module):
         fov_cameras = nerf_cameras.p3d_cameras[cam_idx]
         no_proj_mask = no_depth_mask.view(-1)
         all_world_points = fov_cameras.unproject_points(ndc_points, scaled_depth_input=False).view(-1, 3)
-        
+
         # Gather info about gaussians surrounding each 3D point
         if use_gaussian_depth:
             closest_gaussians_idx = self.get_gaussians_closest_to_samples(all_world_points)
@@ -1373,31 +1477,31 @@ class SuGaR(nn.Module):
         else:
             gaussian_idx = fragments.pix_to_face[..., 0].view(-1) // self.n_triangles_per_gaussian
             closest_gaussians_idx = self.knn_idx[gaussian_idx]
-        
+
         # We compute the standard deviation of the gaussian at each point
         gaussian_to_camera = torch.nn.functional.normalize(fov_cameras.get_camera_center() - self.points, dim=-1)
         gaussian_standard_deviations = (self.scaling * quaternion_apply(quaternion_invert(self.quaternions), gaussian_to_camera)).norm(dim=-1)
         points_stds = gaussian_standard_deviations[closest_gaussians_idx[..., 0]]
-        
+
         # We compute ray samples
         points_range = torch.linspace(-range_size, range_size, n_points_in_range).to(self.device).view(1, -1, 1)  # (1, n_points_in_range, 1)
         points_range = points_range * points_stds[..., None, None].expand(-1, n_points_in_range, 1)  # (n_points, n_points_in_range, 1)
         camera_to_samples = torch.nn.functional.normalize(all_world_points - fov_cameras.get_camera_center(), dim=-1)  # (n_points, 3)
         samples = (all_world_points[:, None, :] + points_range * camera_to_samples[:, None, :]).view(-1, 3)  # (n_points * n_points_in_range, 3)
         samples_closest_gaussians_idx = closest_gaussians_idx[:, None, :].expand(-1, n_points_in_range, -1).reshape(-1, self.knn_to_track)
-        
+
         # Compute densities of all samples
         densities = torch.zeros(len(samples), dtype=torch.float, device=self.device)
         gaussian_strengths = self.strengths
         gaussian_centers = self.points
         gaussian_inv_scaled_rotation = self.get_covariance(return_full_matrix=True, return_sqrt=True, inverse_scales=True)
-        
+
         for i in range(0, len(samples), n_points_per_pass):
             i_start = i
             i_end = min(len(samples), i + n_points_per_pass)
-            
+
             pass_closest_gaussians_idx = samples_closest_gaussians_idx[i_start:i_end]
-            
+
             closest_gaussian_centers = gaussian_centers[pass_closest_gaussians_idx]
             closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[pass_closest_gaussians_idx]
             closest_gaussian_strengths = gaussian_strengths[pass_closest_gaussians_idx]
@@ -1414,10 +1518,10 @@ class SuGaR(nn.Module):
             pass_densities = neighbor_opacities.sum(dim=-1)
             pass_density_mask = pass_densities >= 1.
             pass_densities[pass_density_mask] = pass_densities[pass_density_mask] / (pass_densities[pass_density_mask].detach() + 1e-12)
-            
+
             densities[i_start:i_end] = pass_densities
         densities = densities.reshape(-1, n_points_in_range)
-        
+
         # Compute first surface intersection points
         if not just_use_depth_as_level:
             under_level = (densities - surface_level < 0)
@@ -1441,10 +1545,10 @@ class SuGaR(nn.Module):
         else:
             intersection_points = all_world_points[~no_proj_mask]
             empty_pixels = torch.zeros(densities.shape[0], dtype=torch.bool, device=self.device)
-        
+
         if return_depth or return_gaussian_idx or return_normals:
             outputs = {}
-            
+
             if return_depth:
                 valid_z = p3d_cameras.get_world_to_view_transform().transform_points(intersection_points)[..., 2]
                 new_zbuf = -torch.ones(self.image_height * self.image_width, dtype=torch.float, device=self.device)
@@ -1452,11 +1556,11 @@ class SuGaR(nn.Module):
                 new_zbuf = new_zbuf.reshape(self.image_height, self.image_width)
                 outputs['new_zbuf'] = new_zbuf
                 outputs['empty_pixels'] = empty_pixels
-                
+
             if return_gaussian_idx:
                 outputs['gaussian_idx'] = gaussian_idx[~empty_pixels]
-            
-            if return_normals:                
+
+            if return_normals:
                 points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
 
                 closest_gaussian_centers = gaussian_centers[points_closest_gaussians_idx]
@@ -1472,26 +1576,26 @@ class SuGaR(nn.Module):
                     closest_gaussian_min_scales = self.scaling.min(dim=-1)[0][points_closest_gaussians_idx]
                     neighbor_opacities = (shift * closest_gaussian_normals).sum(dim=-1).pow(2)  / (closest_gaussian_min_scales).pow(2)
                 neighbor_opacities = density_factor * closest_gaussian_strengths[..., 0] * torch.exp(-1. / 2 * neighbor_opacities)
-                
+
                 if not compute_flat_normals:
                     density_grad = (neighbor_opacities[..., None] * (closest_gaussian_inv_scaled_rotation @ warped_shift)[..., 0]).sum(dim=-2)
                 else:
                     closest_gaussian_normals = self.get_normals()[points_closest_gaussians_idx]
                     closest_gaussian_min_scales = self.scaling.min(dim=-1, keepdim=True)[0][points_closest_gaussians_idx]
                     density_grad = (
-                        neighbor_opacities[..., None] * 
+                        neighbor_opacities[..., None] *
                         1. / (closest_gaussian_min_scales).pow(2)  * (shift * closest_gaussian_normals).sum(dim=-1, keepdim=True) * closest_gaussian_normals
                         ).sum(dim=-2)
-                
+
                 intersection_normals = -torch.nn.functional.normalize(density_grad, dim=-1)
                 outputs['normals'] = intersection_normals
-                
+
             return intersection_points, outputs
 
         return intersection_points
-    
+
     def compute_level_surface_points_from_camera_efficient(
-        self, 
+        self,
         nerf_cameras=None,
         cam_idx=0,
         rasterizer=None,
@@ -1515,34 +1619,34 @@ class SuGaR(nn.Module):
         # Remember to reset neighbors and update texture features before calling this function
         if nerf_cameras is None:
             nerf_cameras = self.nerfmodel.training_cameras
-        
+
         if primitive_types is not None:
             self.primitive_types = primitive_types
-            
+
         if triangle_scale is not None:
             self.triangle_scale = triangle_scale
-            
+
         if rasterizer is None:
             faces_per_pixel = 10
             max_faces_per_bin = 50_000
 
             mesh_raster_settings = RasterizationSettings(
                 image_size=(self.image_height, self.image_width),
-                blur_radius=0.0, 
+                blur_radius=0.0,
                 faces_per_pixel=faces_per_pixel,
                 max_faces_per_bin=max_faces_per_bin
             )
             rasterizer = MeshRasterizer(
-                    cameras=nerf_cameras.p3d_cameras[cam_idx], 
+                    cameras=nerf_cameras.p3d_cameras[cam_idx],
                     raster_settings=mesh_raster_settings,
                 )
-            
+
         p3d_cameras = nerf_cameras.p3d_cameras[cam_idx]
-        
+
         # Compute splatted depth
         if use_gaussian_depth:
             point_depth = p3d_cameras.get_world_to_view_transform().transform_points(self.points)[..., 2:].expand(-1, 3)
-            depth = self.render_image_gaussian_rasterizer( 
+            depth = self.render_image_gaussian_rasterizer(
                     camera_indices=cam_idx,
                     bg_color=torch.Tensor([-1., -1., -1.]).to(self.device),
                     sh_deg=0,
@@ -1556,7 +1660,7 @@ class SuGaR(nn.Module):
         else:
             if True:
                 textures_img = self.get_texture_img(
-                    nerf_cameras=nerf_cameras, 
+                    nerf_cameras=nerf_cameras,
                     cam_idx=cam_idx,
                     sh_levels=self.sh_levels,
                     )
@@ -1572,7 +1676,7 @@ class SuGaR(nn.Module):
             depth = fragments.zbuf[0, ..., 0]
             no_depth_mask = depth < 0.
             depth[no_depth_mask] = depth.max() * 1.05
-        
+
         # We backproject the points in world space
         batch_size = 1
         x_tab = torch.Tensor([[i for j in range(self.image_width)] for i in range(self.image_height)]).to(self.device)
@@ -1592,7 +1696,7 @@ class SuGaR(nn.Module):
         fov_cameras = nerf_cameras.p3d_cameras[cam_idx]
         no_proj_mask = no_depth_mask.view(-1)
         all_world_points = fov_cameras.unproject_points(ndc_points, scaled_depth_input=False).view(-1, 3)
-        
+
         # Gather info about gaussians surrounding each 3D point
         if use_gaussian_depth:
             closest_gaussians_idx = self.get_gaussians_closest_to_samples(all_world_points)
@@ -1600,31 +1704,31 @@ class SuGaR(nn.Module):
         else:
             gaussian_idx = fragments.pix_to_face[..., 0].view(-1) // self.n_triangles_per_gaussian
             closest_gaussians_idx = self.knn_idx[gaussian_idx]
-        
+
         # We compute the standard deviation of the gaussian at each point
         gaussian_to_camera = torch.nn.functional.normalize(fov_cameras.get_camera_center() - self.points, dim=-1)
         gaussian_standard_deviations = (self.scaling * quaternion_apply(quaternion_invert(self.quaternions), gaussian_to_camera)).norm(dim=-1)
         points_stds = gaussian_standard_deviations[closest_gaussians_idx[..., 0]]
-        
+
         # We compute ray samples
         points_range = torch.linspace(-range_size, range_size, n_points_in_range).to(self.device).view(1, -1, 1)  # (1, n_points_in_range, 1)
         points_range = points_range * points_stds[..., None, None].expand(-1, n_points_in_range, 1)  # (n_points, n_points_in_range, 1)
         camera_to_samples = torch.nn.functional.normalize(all_world_points - fov_cameras.get_camera_center(), dim=-1)  # (n_points, 3)
         samples = (all_world_points[:, None, :] + points_range * camera_to_samples[:, None, :]).view(-1, 3)  # (n_points * n_points_in_range, 3)
         samples_closest_gaussians_idx = closest_gaussians_idx[:, None, :].expand(-1, n_points_in_range, -1).reshape(-1, self.knn_to_track)
-        
+
         # Compute densities of all samples
         densities = torch.zeros(len(samples), dtype=torch.float, device=self.device)
         gaussian_strengths = self.strengths
         gaussian_centers = self.points
         gaussian_inv_scaled_rotation = self.get_covariance(return_full_matrix=True, return_sqrt=True, inverse_scales=True)
-        
+
         for i in range(0, len(samples), n_points_per_pass):
             i_start = i
             i_end = min(len(samples), i + n_points_per_pass)
-            
+
             pass_closest_gaussians_idx = samples_closest_gaussians_idx[i_start:i_end]
-            
+
             closest_gaussian_centers = gaussian_centers[pass_closest_gaussians_idx]
             closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[pass_closest_gaussians_idx]
             closest_gaussian_strengths = gaussian_strengths[pass_closest_gaussians_idx]
@@ -1641,15 +1745,15 @@ class SuGaR(nn.Module):
             pass_densities = neighbor_opacities.sum(dim=-1)
             pass_density_mask = pass_densities >= 1.
             pass_densities[pass_density_mask] = pass_densities[pass_density_mask] / (pass_densities[pass_density_mask].detach() + 1e-12)
-            
+
             densities[i_start:i_end] = pass_densities
         densities = densities.reshape(-1, n_points_in_range)
-        
+
         # Compute first surface intersection points
         all_outputs = {}
         for surface_level in surface_levels:
             outputs = {}
-                        
+
             under_level = (densities - surface_level < 0)
             above_level = (densities - surface_level > 0)
 
@@ -1673,7 +1777,7 @@ class SuGaR(nn.Module):
                 empty_pixels = torch.zeros_like(empty_pixels, dtype=torch.bool)
                 intersection_points = all_world_points[~empty_pixels]
             outputs['intersection_points'] = intersection_points
-            
+
             if return_depth:
                 valid_z = p3d_cameras.get_world_to_view_transform().transform_points(intersection_points)[..., 2]
                 new_zbuf = -torch.ones(self.image_height * self.image_width, dtype=torch.float, device=self.device)
@@ -1681,11 +1785,11 @@ class SuGaR(nn.Module):
                 new_zbuf = new_zbuf.reshape(self.image_height, self.image_width)
                 outputs['new_zbuf'] = new_zbuf
                 outputs['empty_pixels'] = empty_pixels
-                
+
             if return_gaussian_idx:
                 outputs['gaussian_idx'] = gaussian_idx[~empty_pixels]
-            
-            if return_normals:                
+
+            if return_normals:
                 points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
 
                 closest_gaussian_centers = gaussian_centers[points_closest_gaussians_idx]
@@ -1701,26 +1805,26 @@ class SuGaR(nn.Module):
                     closest_gaussian_min_scales = self.scaling.min(dim=-1)[0][points_closest_gaussians_idx]
                     neighbor_opacities = (shift * closest_gaussian_normals).sum(dim=-1).pow(2)  / (closest_gaussian_min_scales).pow(2)
                 neighbor_opacities = density_factor * closest_gaussian_strengths[..., 0] * torch.exp(-1. / 2 * neighbor_opacities)
-                
+
                 if not compute_flat_normals:
                     density_grad = (neighbor_opacities[..., None] * (closest_gaussian_inv_scaled_rotation @ warped_shift)[..., 0]).sum(dim=-2)
                 else:
                     closest_gaussian_normals = self.get_normals()[points_closest_gaussians_idx]
                     closest_gaussian_min_scales = self.scaling.min(dim=-1, keepdim=True)[0][points_closest_gaussians_idx]
                     density_grad = (
-                        neighbor_opacities[..., None] * 
+                        neighbor_opacities[..., None] *
                         1. / (closest_gaussian_min_scales).pow(2)  * (shift * closest_gaussian_normals).sum(dim=-1, keepdim=True) * closest_gaussian_normals
                         ).sum(dim=-2)
-                
+
                 intersection_normals = -torch.nn.functional.normalize(density_grad, dim=-1)
                 outputs['normals'] = intersection_normals
-                    
+
             all_outputs[surface_level] = outputs
 
         return all_outputs
-    
+
     def compute_level_surface_points_from_camera_fast(
-        self, 
+        self,
         nerf_cameras=None,
         cam_idx=0,
         rasterizer=None,
@@ -1744,37 +1848,37 @@ class SuGaR(nn.Module):
         # Remember to reset neighbors and update texture features before calling this function
         if nerf_cameras is None:
             nerf_cameras = self.nerfmodel.training_cameras
-        
+
         if primitive_types is not None:
             self.primitive_types = primitive_types
-            
+
         if triangle_scale is not None:
             self.triangle_scale = triangle_scale
-            
+
         if rasterizer is None:
             faces_per_pixel = 10
             max_faces_per_bin = 50_000
 
             mesh_raster_settings = RasterizationSettings(
                 image_size=(self.image_height, self.image_width),
-                blur_radius=0.0, 
+                blur_radius=0.0,
                 faces_per_pixel=faces_per_pixel,
                 max_faces_per_bin=max_faces_per_bin
             )
             rasterizer = MeshRasterizer(
-                    cameras=nerf_cameras.p3d_cameras[cam_idx], 
+                    cameras=nerf_cameras.p3d_cameras[cam_idx],
                     raster_settings=mesh_raster_settings,
                 )
-            
+
         p3d_cameras = nerf_cameras.p3d_cameras[cam_idx]
-        
+
         # Compute splatted depth
-        # (either using Gaussian Splatting rasterizer, 
-        # or using PyTorch3D's triangle rasterizer for sharper results 
+        # (either using Gaussian Splatting rasterizer,
+        # or using PyTorch3D's triangle rasterizer for sharper results
         # and instant access to closest gaussian index for each pixel.)
         if use_gaussian_depth:
             point_depth = p3d_cameras.get_world_to_view_transform().transform_points(self.points)[..., 2:].expand(-1, 3)
-            depth = self.render_image_gaussian_rasterizer( 
+            depth = self.render_image_gaussian_rasterizer(
                     camera_indices=cam_idx,
                     bg_color=torch.Tensor([-1., -1., -1.]).to(self.device),
                     sh_deg=0,
@@ -1786,7 +1890,7 @@ class SuGaR(nn.Module):
         else:
             if True:
                 textures_img = self.get_texture_img(
-                    nerf_cameras=nerf_cameras, 
+                    nerf_cameras=nerf_cameras,
                     cam_idx=cam_idx,
                     sh_levels=self.sh_levels,
                     )
@@ -1802,7 +1906,7 @@ class SuGaR(nn.Module):
             depth = fragments.zbuf[0, ..., 0]
         no_depth_mask = depth < 0.
         depth[no_depth_mask] = depth.max() * 1.05
-        
+
         # We backproject the points in world space
         batch_size = 1
         x_tab = torch.Tensor([[i for j in range(self.image_width)] for i in range(self.image_height)]).to(self.device)
@@ -1819,7 +1923,7 @@ class SuGaR(nn.Module):
                                 depth.view(batch_size, -1, 1)),
                                 dim=-1
                                 ).view(batch_size, self.image_height * self.image_width, 3)
-        
+
         fov_cameras = nerf_cameras.p3d_cameras[cam_idx]
         no_proj_mask = no_depth_mask.view(-1)
         ndc_points = ndc_points[0][~no_proj_mask][None]  # Remove pixels with no projection
@@ -1831,7 +1935,7 @@ class SuGaR(nn.Module):
             ndc_points_idx = torch.randperm(ndc_points.shape[1])[:n_surface_points]
             ndc_points = ndc_points[:, ndc_points_idx]
         all_world_points = fov_cameras.unproject_points(ndc_points, scaled_depth_input=False).view(-1, 3)
-        
+
         # Gather info about gaussians surrounding each 3D point
         if use_gaussian_depth:
             closest_gaussians_idx = self.get_gaussians_closest_to_samples(all_world_points)
@@ -1840,31 +1944,31 @@ class SuGaR(nn.Module):
             gaussian_idx = fragments.pix_to_face[..., 0].view(-1) // self.n_triangles_per_gaussian
             gaussian_idx = gaussian_idx[~no_proj_mask][ndc_points_idx]
             closest_gaussians_idx = self.knn_idx[gaussian_idx]
-        
+
         # We compute the standard deviation of the gaussian at each point
         gaussian_to_camera = torch.nn.functional.normalize(fov_cameras.get_camera_center() - self.points, dim=-1)
         gaussian_standard_deviations = (self.scaling * quaternion_apply(quaternion_invert(self.quaternions), gaussian_to_camera)).norm(dim=-1)
         points_stds = gaussian_standard_deviations[closest_gaussians_idx[..., 0]]
-        
+
         # We compute ray samples
         points_range = torch.linspace(-range_size, range_size, n_points_in_range).to(self.device).view(1, -1, 1)  # (1, n_points_in_range, 1)
         points_range = points_range * points_stds[..., None, None].expand(-1, n_points_in_range, 1)  # (n_points, n_points_in_range, 1)
         camera_to_samples = torch.nn.functional.normalize(all_world_points - fov_cameras.get_camera_center(), dim=-1)  # (n_points, 3)
         samples = (all_world_points[:, None, :] + points_range * camera_to_samples[:, None, :]).view(-1, 3)  # (n_points * n_points_in_range, 3)
         samples_closest_gaussians_idx = closest_gaussians_idx[:, None, :].expand(-1, n_points_in_range, -1).reshape(-1, self.knn_to_track)
-        
+
         # Compute densities of all samples
         densities = torch.zeros(len(samples), dtype=torch.float, device=self.device)
         gaussian_strengths = self.strengths
         gaussian_centers = self.points
         gaussian_inv_scaled_rotation = self.get_covariance(return_full_matrix=True, return_sqrt=True, inverse_scales=True)
-        
+
         for i in range(0, len(samples), n_points_per_pass):
             i_start = i
             i_end = min(len(samples), i + n_points_per_pass)
-            
+
             pass_closest_gaussians_idx = samples_closest_gaussians_idx[i_start:i_end]
-            
+
             closest_gaussian_centers = gaussian_centers[pass_closest_gaussians_idx]
             closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[pass_closest_gaussians_idx]
             closest_gaussian_strengths = gaussian_strengths[pass_closest_gaussians_idx]
@@ -1881,15 +1985,15 @@ class SuGaR(nn.Module):
             pass_densities = neighbor_opacities.sum(dim=-1)
             pass_density_mask = pass_densities >= 1.
             pass_densities[pass_density_mask] = pass_densities[pass_density_mask] / (pass_densities[pass_density_mask].detach() + 1e-12)
-            
+
             densities[i_start:i_end] = pass_densities
         densities = densities.reshape(-1, n_points_in_range)
-        
+
         # Compute first surface intersection points
         all_outputs = {}
         for surface_level in surface_levels:
             outputs = {}
-                        
+
             under_level = (densities - surface_level < 0)
             above_level = (densities - surface_level > 0)
 
@@ -1913,16 +2017,16 @@ class SuGaR(nn.Module):
                 empty_pixels = torch.zeros_like(empty_pixels, dtype=torch.bool)
                 intersection_points = all_world_points[~empty_pixels]
             outputs['intersection_points'] = intersection_points
-            
+
             if return_pixel_idx:
                 pixel_idx = torch.arange(self.image_height * self.image_width, dtype=torch.long, device=self.device)
                 pixel_idx = pixel_idx[~no_proj_mask][ndc_points_idx][~empty_pixels]
                 outputs['pixel_idx'] = pixel_idx
-                
+
             if return_gaussian_idx:
                 outputs['gaussian_idx'] = gaussian_idx[~empty_pixels]
-            
-            if return_normals:                
+
+            if return_normals:
                 points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
 
                 closest_gaussian_centers = gaussian_centers[points_closest_gaussians_idx]
@@ -1938,28 +2042,193 @@ class SuGaR(nn.Module):
                     closest_gaussian_min_scales = self.scaling.min(dim=-1)[0][points_closest_gaussians_idx]
                     neighbor_opacities = (shift * closest_gaussian_normals).sum(dim=-1).pow(2)  / (closest_gaussian_min_scales).pow(2)
                 neighbor_opacities = density_factor * closest_gaussian_strengths[..., 0] * torch.exp(-1. / 2 * neighbor_opacities)
-                
+
                 if not compute_flat_normals:
                     density_grad = (neighbor_opacities[..., None] * (closest_gaussian_inv_scaled_rotation @ warped_shift)[..., 0]).sum(dim=-2)
                 else:
                     closest_gaussian_normals = self.get_normals()[points_closest_gaussians_idx]
                     closest_gaussian_min_scales = self.scaling.min(dim=-1, keepdim=True)[0][points_closest_gaussians_idx]
                     density_grad = (
-                        neighbor_opacities[..., None] * 
+                        neighbor_opacities[..., None] *
                         1. / (closest_gaussian_min_scales).pow(2)  * (shift * closest_gaussian_normals).sum(dim=-1, keepdim=True) * closest_gaussian_normals
                         ).sum(dim=-2)
-                
+
                 intersection_normals = -torch.nn.functional.normalize(density_grad, dim=-1)
                 outputs['normals'] = intersection_normals
-                    
+
             all_outputs[surface_level] = outputs
 
         return all_outputs
-    
+
+    def diff_gaussian_rasterizer_shading_forward(
+        self,
+        viewpoint_camera,
+        rgb_bg,
+        material,
+        bg_color: torch.Tensor,
+        scaling_modifier=1.0,
+        override_color=None,
+        instance_id=-1,
+        **kwargs
+    ):
+        bg_color = bg_color * 0
+        active_sh_degree = 0  # TODO: fixed param
+        # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+        screenspace_points = (
+            torch.zeros_like(
+                self._points, dtype=self._points.dtype, requires_grad=True, device="cuda"
+            )
+            + 0
+        )
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
+
+        # Set up rasterization configuration
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=active_sh_degree,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=False,
+        )
+
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+        # For safety, we here register another tensor that can continue the graph computation.
+        means3D = self._points * 1.0
+        # =========== custom: TODO: optimize_layout = False
+        # if pc.cfg.optimize_layout:
+        #     means3D[..., 0] = means3D[..., 0] + torch.repeat_interleave(pc.get_layout_depths, pc.mark_instances)
+        # ===========
+        means2D = screenspace_points
+        opacity = self.strengths.view(-1, 1)
+
+        # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+        # scaling / rotation by the rasterizer.
+
+
+        cov3D_precomp = None
+        scales = self.scaling
+        rotations = self.get_rotation
+
+        # syl=========== make the selected instance available
+        # if instance_id != -1:
+        #     instance_mask = torch.zeros(means3D.shape[0], device=means3D.device)
+        #     mark_accum = torch.cumsum(pc.mark_instances, dim=0)
+        #     if instance_id == 0:
+        #         instance_mask[0: mark_accum[0]] = 1
+        #     else:
+        #         instance_mask[mark_accum[instance_id - 1]: mark_accum[instance_id]] = 1
+        #     opacity = opacity * instance_mask.unsqueeze(-1)  # (N, 3) * (N,`1) 会广播
+        # syl=========== make the selected instance available
+
+        # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+        # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+        shs = None
+        colors_precomp = None
+        if override_color is None:
+            shs = self.get_features
+        else:
+            colors_precomp = override_color
+
+        # Rasterize visible Gaussians to image, obtain their radii (on screen).
+        batch_idx = kwargs["batch_idx"]
+        rays_d = kwargs["rays_d"][batch_idx]
+        rays_o = kwargs["rays_o"][batch_idx]
+        # rays_d_flatten: Float[Tensor, "Nr 3"] = rays_d.unsqueeze(0)
+
+        comp_rgb_bg = rgb_bg(dirs=rays_d.unsqueeze(0))
+
+        rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp,
+        )
+        _, H, W = rendered_image.shape
+
+        xyz_map = rays_o + rendered_depth.permute(1, 2, 0) * rays_d
+        normal_map = self.normal_module(xyz_map.permute(2, 0, 1).unsqueeze(0))[0]
+        normal_map = F.normalize(normal_map, dim=0)
+
+        # if pc.cfg.pred_normal:
+        #     pred_normal_map, _, _, _ = rasterizer(
+        #         means3D=means3D,
+        #         means2D=torch.zeros_like(means2D),
+        #         shs=pc.get_normal.unsqueeze(1),
+        #         colors_precomp=None,
+        #         opacities=opacity,
+        #         scales=scales,
+        #         rotations=rotations,
+        #         cov3D_precomp=cov3D_precomp,
+        #     )
+        # else:
+        #     pred_normal_map = None
+        pred_normal_map = None
+
+        light_positions = kwargs["light_positions"][batch_idx, None, None, :].expand(
+            H, W, -1
+        )
+
+        if pred_normal_map is not None:
+            shading_normal = pred_normal_map.permute(1, 2, 0).detach() * 2 - 1
+            shading_normal = F.normalize(shading_normal, dim=2)
+        else:
+            shading_normal = normal_map.permute(1, 2, 0)
+        rgb_fg = material(
+            positions=xyz_map,
+            shading_normal=shading_normal,
+            albedo=(rendered_image / (rendered_alpha + 1e-6)).permute(1, 2, 0),
+            light_positions=light_positions,
+        ).permute(2, 0, 1)
+
+        rendered_image = rgb_fg * rendered_alpha + (
+            1 - rendered_alpha
+        ) * comp_rgb_bg.reshape(H, W, 3).permute(2, 0, 1)
+        normal_map = normal_map * 0.5 * rendered_alpha + 0.5
+        mask = rendered_alpha > 0.99
+        normal_mask = mask.repeat(3, 1, 1)
+        normal_map[~normal_mask] = normal_map[~normal_mask].detach()
+        rendered_depth[~mask] = rendered_depth[~mask].detach()
+
+        # Retain gradients of the 2D (screen-space) means for batch dim
+        if self.training:
+            screenspace_points.retain_grad()
+
+        # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+        # They will be excluded from value updates used in the splitting criteria.
+        return {
+            "render": rendered_image.clamp(0, 1),
+            "normal": normal_map,
+            "pred_normal": pred_normal_map,
+            "mask": rendered_alpha,
+            "depth": rendered_depth,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": radii > 0,
+            "radii": radii,
+        }
+
     def render_image_gaussian_rasterizer(
-        self, 
-        nerf_cameras:CamerasWrapper=None, 
-        camera_indices:int=0,
+        self,
+        batch,
+        comp_rgb_bg,
+        material,
         verbose=False,
         bg_color = None,
         sh_deg:int=None,
@@ -1999,178 +2268,95 @@ class SuGaR(nn.Module):
         Returns:
             _type_: _description_
         """
+        bs = batch["c2w"].shape[0]
+        renders = []
+        viewspace_points = []
+        visibility_filters = []
+        radiis = []
+        normals = []
+        pred_normals = []
+        depths = []
+        masks = []
 
-        if nerf_cameras is None:
-            nerf_cameras = self.nerfmodel.training_cameras
-        if test_cameras:
-            nerf_cameras = self.nerfmodel.test_cameras
+        for batch_idx in range(bs):
+            batch["batch_idx"] = batch_idx
+            fovy = batch["fovy"][batch_idx]
+            w2c, proj, cam_p = get_cam_info_gaussian(
+                c2w=batch["c2w"][batch_idx], fovx=fovy, fovy=fovy, znear=0.1, zfar=100
+            )
 
-        p3d_camera = nerf_cameras.p3d_cameras[camera_indices]
+            # import pdb; pdb.set_trace()
+            viewpoint_cam = Camera(
+                FoVx=fovy,
+                FoVy=fovy,
+                image_width=batch["width"],
+                image_height=batch["height"],
+                world_view_transform=w2c,
+                full_proj_transform=proj,
+                camera_center=cam_p,
+            )
 
-        if bg_color is None:
-            bg_color = torch.Tensor([0.0, 0.0, 0.0]).to(self.device)
-            
-        if positions is None:
-            positions = self.points.detach().clone()     # do not move points while splatting
+            with autocast(enabled=False):
+                # TODO: fixed instance_id
+                render_pkg = self.diff_gaussian_rasterizer_shading_forward(
+                    viewpoint_cam,
+                    rgb_bg=comp_rgb_bg,
+                    material=material,
+                    bg_color=bg_color,
+                    **batch,
+                    instance_id=-1,
+                )
 
-        use_torch = False
-        # NeRF 'transform_matrix' is a camera-to-world transform
-        c2w = nerf_cameras.camera_to_worlds[camera_indices]
-        c2w = torch.cat([c2w, torch.Tensor([[0, 0, 0, 1]]).to(self.device)], dim=0).cpu().numpy() #.transpose(-1, -2)
-        # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-        c2w[:3, 1:3] *= -1
+                renders.append(render_pkg["render"])
+                viewspace_points.append(render_pkg["viewspace_points"])
+                visibility_filters.append(render_pkg["visibility_filter"])
+                radiis.append(render_pkg["radii"])
+                if render_pkg.__contains__("normal"):
+                    normals.append(render_pkg["normal"])
+                if (
+                    render_pkg.__contains__("pred_normal")
+                    and render_pkg["pred_normal"] is not None
+                ):
+                    pred_normals.append(render_pkg["pred_normal"])
+                if render_pkg.__contains__("depth"):
+                    depths.append(render_pkg["depth"])
+                if render_pkg.__contains__("mask"):
+                    masks.append(render_pkg["mask"])
 
-        # get the world-to-camera transform and set R, T
-        w2c = np.linalg.inv(c2w)
-        R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-        T = w2c[:3, 3]
-        
-        world_view_transform = torch.Tensor(getWorld2View(
-            R=R, t=T, tensor=use_torch)).transpose(0, 1).cuda()
-        
-        proj_transform = getProjectionMatrix(
-            p3d_camera.znear.item(), 
-            p3d_camera.zfar.item(), 
-            self.fov_x, 
-            self.fov_y).transpose(0, 1).cuda()
-        # TODO: THE TWO FOLLOWING LINES ARE IMPORTANT! IT'S NOT HERE IN 3DGS CODE! Should make a PR when I have time
-        proj_transform[..., 2, 0] = - p3d_camera.K[0, 0, 2]
-        proj_transform[..., 2, 1] = - p3d_camera.K[0, 1, 2]
-        
-        full_proj_transform = (world_view_transform.unsqueeze(0).bmm(proj_transform.unsqueeze(0))).squeeze(0)
-        
+        outputs = {
+            "comp_rgb": torch.stack(renders, dim=0).permute(0, 2, 3, 1),
+            "viewspace_points": viewspace_points,
+            "visibility_filter": visibility_filters,
+            "radii": radiis,
+        }
+        if len(normals) > 0:
+            outputs.update(
+                {
+                    "comp_normal": torch.stack(normals, dim=0).permute(0, 2, 3, 1),
+                }
+            )
+        if len(pred_normals) > 0:
+            outputs.update(
+                {
+                    "comp_pred_normal": torch.stack(pred_normals, dim=0).permute(
+                        0, 2, 3, 1
+                    ),
+                }
+            )
+        if len(depths) > 0:
+            outputs.update(
+                {
+                    "comp_depth": torch.stack(depths, dim=0).permute(0, 2, 3, 1),
+                }
+            )
+        if len(masks) > 0:
+            outputs.update(
+                {
+                    "comp_mask": torch.stack(masks, dim=0).permute(0, 2, 3, 1),
+                }
+            )
+        return outputs
 
-        camera_center = p3d_camera.get_camera_center()
-        if verbose:
-            print("p3d camera_center", camera_center)
-            print("ns camera_center", nerf_cameras.camera_to_worlds[camera_indices][..., 3])
-
-        raster_settings = GaussianRasterizationSettings(
-            image_height=int(self.image_height),
-            image_width=int(self.image_width),
-            tanfovx=self.tanfovx,
-            tanfovy=self.tanfovy,
-            bg=bg_color,
-            scale_modifier=1.,
-            viewmatrix=world_view_transform,
-            projmatrix=full_proj_transform,
-            sh_degree=sh_deg,
-            campos=camera_center,
-            prefiltered=False,
-            debug=False
-        )
-    
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-        # TODO: Change color computation to match 3DGS paper (remove sigmoid)
-        if point_colors is None:
-            if not compute_color_in_rasterizer:
-                if sh_rotations is None:
-                    splat_colors = self.get_points_rgb(
-                        positions=positions, 
-                        camera_centers=camera_center,
-                        sh_levels=sh_deg+1,)
-                else:
-                    splat_colors = self.get_points_rgb(
-                        positions=positions, 
-                        camera_centers=None,
-                        directions=(torch.nn.functional.normalize(positions - camera_center, dim=-1).unsqueeze(1) @ sh_rotations)[..., 0, :],
-                        sh_levels=sh_deg+1,)
-                shs = None
-            else:
-                shs = self.sh_coordinates
-                splat_colors = None
-        else:
-            splat_colors = point_colors
-            shs = None
-            
-        splat_opacities = self.strengths.view(-1, 1)
-        
-        if quaternions is None:
-            quaternions = self.quaternions
-        
-        if not use_same_scale_in_all_directions:
-            scales = self.scaling
-        else:
-            scales = self.scaling.mean(dim=-1, keepdim=True).expand(-1, 3)
-            scales = scales.squeeze(0)
-        
-        if verbose:
-            print("Scales:", scales.shape, scales.min(), scales.max())
-
-        if not compute_covariance_in_rasterizer:            
-            cov3Dmatrix = torch.zeros((scales.shape[0], 3, 3), dtype=torch.float, device=self.device)
-            rotation = quaternion_to_matrix(quaternions)
-
-            cov3Dmatrix[:,0,0] = scales[:,0]**2
-            cov3Dmatrix[:,1,1] = scales[:,1]**2
-            cov3Dmatrix[:,2,2] = scales[:,2]**2
-            cov3Dmatrix = rotation @ cov3Dmatrix @ rotation.transpose(-1, -2)
-            # cov3Dmatrix = rotation @ cov3Dmatrix
-            
-            cov3D = torch.zeros((cov3Dmatrix.shape[0], 6), dtype=torch.float, device=self.device)
-
-            cov3D[:, 0] = cov3Dmatrix[:, 0, 0]
-            cov3D[:, 1] = cov3Dmatrix[:, 0, 1]
-            cov3D[:, 2] = cov3Dmatrix[:, 0, 2]
-            cov3D[:, 3] = cov3Dmatrix[:, 1, 1]
-            cov3D[:, 4] = cov3Dmatrix[:, 1, 2]
-            cov3D[:, 5] = cov3Dmatrix[:, 2, 2]
-            
-            quaternions = None
-            scales = None
-        else:
-            cov3D = None
-        
-        # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-        # screenspace_points = torch.zeros_like(self._points, dtype=self._points.dtype, requires_grad=True, device=self.device) + 0
-        screenspace_points = torch.zeros(self.n_points, 3, dtype=self._points.dtype, requires_grad=True, device=self.device)
-        if return_2d_radii:
-            try:
-                screenspace_points.retain_grad()
-            except:
-                print("WARNING: return_2d_radii is True, but failed to retain grad of screenspace_points!")
-                pass
-        means2D = screenspace_points
-        
-        if verbose:
-            print("points", positions.shape)
-            if not compute_color_in_rasterizer:
-                print("splat_colors", splat_colors.shape)
-            print("splat_opacities", splat_opacities.shape)
-            if not compute_covariance_in_rasterizer:
-                print("cov3D", cov3D.shape)
-                print(cov3D[0])
-            else:
-                print("quaternions", quaternions.shape)
-                print("scales", scales.shape)
-            print("screenspace_points", screenspace_points.shape)
-
-        rendered_image, radii = rasterizer(
-            means3D = positions,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = splat_colors,
-            opacities = torch.where(splat_opacities>0.95, splat_opacities, torch.tensor([0.95]).cuda()),
-            scales = scales,
-            rotations = quaternions,
-            cov3D_precomp = cov3D)
-        
-        if not(return_2d_radii or return_opacities or return_colors):
-            return rendered_image.transpose(0, 1).transpose(1, 2)
-        
-        else:
-            outputs = {
-                "image": rendered_image.transpose(0, 1).transpose(1, 2),
-                "radii": radii,
-                "viewspace_points": screenspace_points,
-            }
-            if return_opacities:
-                outputs["opacities"] = splat_opacities
-            if return_colors:
-                outputs["colors"] = splat_colors
-        
-            return outputs
 
     def save_model(self, path, **kwargs):
         checkpoint = {}
@@ -2209,6 +2395,11 @@ class SuGaR(nn.Module):
         dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
+
+        # === added for supporting LGM format
+        xyz[:, [0, 1, 2]] = xyz[:, [1, 2, 0]]
+        # === added for supporting LGM format
+
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
@@ -2477,7 +2668,7 @@ def load_refined_model(refined_sugar_path, nerfmodel:GaussianSplattingWrapper):
         o3d_mesh.triangles = o3d.utility.Vector3iVector(checkpoint['state_dict']['_surface_mesh_faces'].cpu().numpy())
         # o3d_mesh.vertex_normals = o3d.utility.Vector3dVector(normals.cpu().numpy())
         o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(torch.ones_like(checkpoint['state_dict']['_points']).cpu().numpy())
-        
+
     refined_sugar = SuGaR(
         nerfmodel=nerfmodel,
         points=checkpoint['state_dict']['_points'],
@@ -2491,13 +2682,13 @@ def load_refined_model(refined_sugar_path, nerfmodel:GaussianSplattingWrapper):
         n_gaussians_per_surface_triangle=n_gaussians_per_surface_triangle,
         )
     refined_sugar.load_state_dict(checkpoint['state_dict'])
-    
+
     return refined_sugar
 
 
 def load_rc_model(
-    nerfmodel, 
-    rc_path, 
+    nerfmodel,
+    rc_path,
     initialize=True,
     sh_levels=3,
     learnable_positions=True,
@@ -2509,27 +2700,27 @@ def load_rc_model(
     ):
 
     checkpoint = torch.load(rc_path, map_location=nerfmodel.device)
-    
+
     if retrocompatibility:
         if not '_points' in checkpoint['state_dict'].keys():
             checkpoint['state_dict']['_points'] = checkpoint['state_dict']['points']
             checkpoint['state_dict'].pop('points')
-            
+
         if not '_sh_coordinates_dc' in checkpoint['state_dict'].keys():
             checkpoint['state_dict']['_sh_coordinates_dc'] = checkpoint['state_dict']['sh_coordinates'][..., 0:1, :]
             checkpoint['state_dict']['_sh_coordinates_rest'] = checkpoint['state_dict']['sh_coordinates'][..., 1:, :]
             checkpoint['state_dict'].pop('sh_coordinates')
-            
+
         if not '_scales' in checkpoint['state_dict'].keys():
             checkpoint['state_dict']['_scales'] = checkpoint['state_dict']['radiuses'][0, ..., 4:]
             checkpoint['state_dict']['_quaternions'] = checkpoint['state_dict']['radiuses'][0, ..., :4]
             checkpoint['state_dict'].pop('radiuses')
-            
+
         if '_scales' in checkpoint['state_dict'].keys():
             if checkpoint['state_dict']['_scales'].shape[0] == 1:
                 checkpoint['state_dict']['_scales'] = checkpoint['state_dict']['_scales'].squeeze(0)
                 checkpoint['state_dict']['_quaternions'] = checkpoint['state_dict']['_quaternions'].squeeze(0)
-                
+
     if retrocompatibility:
         checkpoint_state_dict = {}
         checkpoint_state_dict['_points'] = checkpoint['state_dict']['_points']
@@ -2538,12 +2729,12 @@ def load_rc_model(
         checkpoint_state_dict['_scales'] = checkpoint['state_dict']['_scales']
         checkpoint_state_dict['_quaternions'] = checkpoint['state_dict']['_quaternions']
         checkpoint_state_dict['all_densities'] = checkpoint['state_dict']['all_densities']
-    
+
     if not use_light_probes:
         colors = SH2RGB(checkpoint['state_dict']['_sh_coordinates_dc'][:, 0, :])
     else:
         colors = 0.5 * torch.ones_like(checkpoint['state_dict']['_points'])
-    
+
     rc = SuGaR(
         nerfmodel=nerfmodel,
         points=checkpoint['state_dict']['_points'],
@@ -2558,23 +2749,23 @@ def load_rc_model(
         n_light_probes=n_light_probes,
         use_grid_for_light_probes=use_grid_for_light_probes,
         )
-    
+
     rc.load_state_dict(checkpoint['state_dict'])
     return rc
 
 
 def _convert_vertex_colors_to_texture(
-    rc:SuGaR, 
+    rc:SuGaR,
     colors:torch.Tensor,
     square_size:int=4,
     ):
     points_to_mesh = rc.points
-    
+
     n_square_per_axis = int(np.sqrt(len(points_to_mesh)) + 1)
     texture_size = square_size * n_square_per_axis
-    
+
     n_features = colors.shape[-1]
-    
+
     point_idx_per_pixel = torch.zeros(texture_size, texture_size, device=rc.device).int()
 
     with torch.no_grad():
@@ -2586,7 +2777,7 @@ def _convert_vertex_colors_to_texture(
 
         # Build verts UVs
         verts_coords = torch.cartesian_prod(
-            torch.arange(n_square_per_axis, device=rc.device), 
+            torch.arange(n_square_per_axis, device=rc.device),
             torch.arange(n_square_per_axis, device=rc.device)
             )[:, None] * square_size
         verts_uv = torch.Tensor(
@@ -2595,7 +2786,7 @@ def _convert_vertex_colors_to_texture(
         verts_uv = verts_uv.view(-1, 2).long()[:4*len(points_to_mesh)] / texture_size
 
         # Build texture image
-        texture_img = torch.zeros(texture_size, texture_size, n_features, device=rc.device)    
+        texture_img = torch.zeros(texture_size, texture_size, n_features, device=rc.device)
         n_squares_filled = 0
         for i in range(n_square_per_axis):
             for j in range(n_square_per_axis):
@@ -2603,20 +2794,20 @@ def _convert_vertex_colors_to_texture(
                     break
                 start_idx_i = i * square_size
                 start_idx_j = j * square_size
-                texture_img[..., 
-                            start_idx_i:start_idx_i + square_size, 
+                texture_img[...,
+                            start_idx_i:start_idx_i + square_size,
                             start_idx_j:start_idx_j + square_size, :] = colors[i*n_square_per_axis + j].unsqueeze(0).unsqueeze(0)
                 point_idx_per_pixel[...,
-                                    start_idx_i:start_idx_i + square_size, 
+                                    start_idx_i:start_idx_i + square_size,
                                     start_idx_j:start_idx_j + square_size] = i*n_square_per_axis + j
                 n_squares_filled += 1
-                
+
         texture_img = texture_img.transpose(0, 1)
         texture_img = texture_img.flip(0)
-        
+
         point_idx_per_pixel = point_idx_per_pixel.transpose(0, 1)
         point_idx_per_pixel = point_idx_per_pixel.flip(0)
-    
+
     return faces_uv, verts_uv, texture_img, point_idx_per_pixel
 
 
@@ -2626,43 +2817,43 @@ def extract_texture_image_and_uv_from_gaussians(
     n_sh=-1,
     texture_with_gaussian_renders=True,
     ):
-    
+
     from pytorch3d.renderer import (
     AmbientLights,
     MeshRenderer,
     SoftPhongShader,
     )
     from pytorch3d.renderer.blending import BlendParams
-    
+
     if square_size < 3:
         raise ValueError("square_size must be >= 3")
-    
+
     surface_mesh = rc.surface_mesh
     verts = surface_mesh.verts_list()[0]
     faces = surface_mesh.faces_list()[0]
     faces_verts = verts[faces]
-    
+
     n_triangles = len(faces)
     n_gaussians_per_triangle = rc.n_gaussians_per_surface_triangle
     n_squares = n_triangles // 2 + 1
     n_square_per_axis = int(np.sqrt(n_squares) + 1)
     texture_size = square_size * (n_square_per_axis)
-    
+
     if n_sh==-1:
         n_sh = rc.sh_coordinates.shape[1]
     faces_features = rc.sh_coordinates[:, :n_sh].reshape(n_triangles, n_gaussians_per_triangle, n_sh * 3)
     n_features = faces_features.shape[-1]
-    
+
     if texture_with_gaussian_renders:
         n_features = 3
-    
+
     # Build faces UV.
     # Each face will have 3 corresponding vertices in the UV map
     faces_uv = torch.arange(3 * n_triangles, device=rc.device).view(n_triangles, 3)  # n_triangles, 3
-    
+
     # Build corresponding vertices UV
     vertices_uv = torch.cartesian_prod(
-        torch.arange(n_square_per_axis, device=rc.device), 
+        torch.arange(n_square_per_axis, device=rc.device),
         torch.arange(n_square_per_axis, device=rc.device))
     bottom_verts_uv = torch.cat(
         [vertices_uv[n_square_per_axis:-1, None], vertices_uv[:-n_square_per_axis-1, None], vertices_uv[n_square_per_axis+1:, None]],
@@ -2670,9 +2861,9 @@ def extract_texture_image_and_uv_from_gaussians(
     top_verts_uv = torch.cat(
         [vertices_uv[1:-n_square_per_axis, None], vertices_uv[:-n_square_per_axis-1, None], vertices_uv[n_square_per_axis+1:, None]],
         dim=1)
-    
+
     vertices_uv = torch.cartesian_prod(
-        torch.arange(n_square_per_axis, device=rc.device), 
+        torch.arange(n_square_per_axis, device=rc.device),
         torch.arange(n_square_per_axis, device=rc.device))[:, None]
     u_shift = torch.tensor([[1, 0]], dtype=torch.int32, device=rc.device)[:, None]
     v_shift = torch.tensor([[0, 1]], dtype=torch.int32, device=rc.device)[:, None]
@@ -2682,7 +2873,7 @@ def extract_texture_image_and_uv_from_gaussians(
     top_verts_uv = torch.cat(
         [vertices_uv + v_shift, vertices_uv, vertices_uv + u_shift + v_shift],
         dim=1)
-    
+
     verts_uv = torch.cat([bottom_verts_uv, top_verts_uv], dim=1)
     verts_uv = verts_uv * square_size
     verts_uv[:, 0] = verts_uv[:, 0] + torch.tensor([[-2, 1]], device=rc.device)
@@ -2692,10 +2883,10 @@ def extract_texture_image_and_uv_from_gaussians(
     verts_uv[:, 4] = verts_uv[:, 4] + torch.tensor([[1, 3]], device=rc.device)
     verts_uv[:, 5] = verts_uv[:, 5] + torch.tensor([[-3, -1]], device=rc.device)
     verts_uv = verts_uv.reshape(-1, 2) / texture_size
-    
+
     # ---Build texture image
     # Start by computing pixel indices for each triangle
-    texture_img = torch.zeros(texture_size, texture_size, n_features, device=rc.device)    
+    texture_img = torch.zeros(texture_size, texture_size, n_features, device=rc.device)
     pixel_idx_inside_bottom_triangle = torch.zeros(0, 2, dtype=torch.int32, device=rc.device)
     pixel_idx_inside_top_triangle = torch.zeros(0, 2, dtype=torch.int32, device=rc.device)
     for tri_i in range(0, square_size-1):
@@ -2706,18 +2897,18 @@ def extract_texture_image_and_uv_from_gaussians(
         for tri_j in range(tri_i+1, square_size):
             pixel_idx_inside_top_triangle = torch.cat(
                 [pixel_idx_inside_top_triangle, torch.tensor([[tri_i, tri_j]], dtype=torch.int32, device=rc.device)], dim=0)
-    
+
     bottom_triangle_pixel_idx = torch.cartesian_prod(
-        torch.arange(n_square_per_axis, device=rc.device), 
+        torch.arange(n_square_per_axis, device=rc.device),
         torch.arange(n_square_per_axis, device=rc.device))[:, None] * square_size + pixel_idx_inside_bottom_triangle[None]
     top_triangle_pixel_idx = torch.cartesian_prod(
-        torch.arange(n_square_per_axis, device=rc.device), 
+        torch.arange(n_square_per_axis, device=rc.device),
         torch.arange(n_square_per_axis, device=rc.device))[:, None] * square_size + pixel_idx_inside_top_triangle[None]
     triangle_pixel_idx = torch.cat(
-        [bottom_triangle_pixel_idx[:, None], 
+        [bottom_triangle_pixel_idx[:, None],
         top_triangle_pixel_idx[:, None]],
         dim=1).view(-1, bottom_triangle_pixel_idx.shape[-2], 2)[:n_triangles]
-    
+
     # Then we compute the barycentric coordinates of each pixel inside its corresponding triangle
     bottom_triangle_pixel_bary_coords = pixel_idx_inside_bottom_triangle.clone().float()
     bottom_triangle_pixel_bary_coords[..., 0] = -(bottom_triangle_pixel_bary_coords[..., 0] - (square_size - 2))
@@ -2737,56 +2928,56 @@ def extract_texture_image_and_uv_from_gaussians(
         [bottom_triangle_pixel_bary_coords[None],
         top_triangle_pixel_bary_coords[None]],
         dim=0)  # 2, n_pixels_per_triangle, 3
-    
+
     all_triangle_bary_coords = triangle_pixel_bary_coords[None].expand(n_squares, -1, -1, -1).reshape(-1, triangle_pixel_bary_coords.shape[-2], 3)
     all_triangle_bary_coords = all_triangle_bary_coords[:len(faces_verts)]
-    
+
     pixels_space_positions = (all_triangle_bary_coords[..., None] * faces_verts[:, None]).sum(dim=-2)[:, :, None]
-    
+
     gaussian_centers = rc.points.reshape(-1, 1, rc.n_gaussians_per_surface_triangle, 3)
     gaussian_inv_scaled_rotation = rc.get_covariance(return_full_matrix=True, return_sqrt=True, inverse_scales=True).reshape(-1, 1, rc.n_gaussians_per_surface_triangle, 3, 3)
-    
+
     # Compute the density field as a sum of local gaussian opacities
     shift = (pixels_space_positions - gaussian_centers)
     warped_shift = gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
     neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
     neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities) # / rc.n_gaussians_per_surface_triangle
-    
+
     pixel_features = faces_features[:, None].expand(-1, neighbor_opacities.shape[1], -1, -1).gather(
         dim=-2,
         index=neighbor_opacities[..., None].argmax(dim=-2, keepdim=True).expand(-1, -1, -1, 3)
         )[:, :, 0, :]
-        
+
     # pixel_alpha = neighbor_opacities.sum(dim=-1, keepdim=True)
     texture_img[(triangle_pixel_idx[..., 0], triangle_pixel_idx[..., 1])] = pixel_features
 
     texture_img = texture_img.transpose(0, 1)
     texture_img = SH2RGB(texture_img.flip(0))
-    
+
     faces_per_pixel = 1
     max_faces_per_bin = 50_000
     mesh_raster_settings = RasterizationSettings(
         image_size=(rc.image_height, rc.image_width),
-        blur_radius=0.0, 
+        blur_radius=0.0,
         faces_per_pixel=faces_per_pixel,
         # max_faces_per_bin=max_faces_per_bin
     )
     lights = AmbientLights(device=rc.device)
     rasterizer = MeshRasterizer(
-            cameras=rc.nerfmodel.training_cameras.p3d_cameras[0], 
+            cameras=rc.nerfmodel.training_cameras.p3d_cameras[0],
             raster_settings=mesh_raster_settings,
     )
     renderer = MeshRenderer(
         rasterizer=rasterizer,
         shader=SoftPhongShader(
-            device=rc.device, 
+            device=rc.device,
             cameras=rc.nerfmodel.training_cameras.p3d_cameras[0],
             lights=lights,
             blend_params=BlendParams(background_color=(0.0, 0.0, 0.0)),
         )
     )
     texture_idx = torch.cartesian_prod(
-        torch.arange(texture_size, device=rc.device), 
+        torch.arange(texture_size, device=rc.device),
         torch.arange(texture_size, device=rc.device)
         ).reshape(texture_size, texture_size, 2
                     )
@@ -2799,26 +2990,26 @@ def extract_texture_image_and_uv_from_gaussians(
         sampling_mode='nearest',
         )
     idx_mesh = Meshes(
-        verts=[rc.surface_mesh.verts_list()[0]],   
+        verts=[rc.surface_mesh.verts_list()[0]],
         faces=[rc.surface_mesh.faces_list()[0]],
         textures=idx_textures_uv,
         )
-    
+
     for cam_idx in range(len(rc.nerfmodel.training_cameras)):
         p3d_cameras = rc.nerfmodel.training_cameras.p3d_cameras[cam_idx]
-        
+
         # Render rgb img
         rgb_img = rc.render_image_gaussian_rasterizer(
             camera_indices=cam_idx,
             sh_deg=0,  #rc.sh_levels-1,
             compute_color_in_rasterizer=True,  #compute_color_in_rasterizer,
         ).clamp(min=0, max=1)
-        
+
         fragments = renderer.rasterizer(idx_mesh, cameras=p3d_cameras)
         idx_img = renderer.shader(fragments, idx_mesh, cameras=p3d_cameras)[0, ..., :2]
         # print("Idx img:", idx_img.shape, idx_img.min(), idx_img.max())
         update_mask = fragments.zbuf[0, ..., 0] > 0
-        idx_to_update = idx_img[update_mask].round().long() 
+        idx_to_update = idx_img[update_mask].round().long()
 
         use_average = True
         if not use_average:
@@ -2831,6 +3022,8 @@ def extract_texture_image_and_uv_from_gaussians(
             texture_counter[(idx_to_update[..., 0], idx_to_update[..., 1])] = texture_counter[(idx_to_update[..., 0], idx_to_update[..., 1])] + 1
 
     if use_average:
-        texture_img = texture_img / texture_counter.clamp(min=1)        
-    
+        texture_img = texture_img / texture_counter.clamp(min=1)
+
     return verts_uv, faces_uv, texture_img
+
+

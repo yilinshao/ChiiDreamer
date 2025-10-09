@@ -99,7 +99,7 @@ def save_ply(gaussians, path, compatible=True):
         elements = np.empty(xyzs.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyzs, f_dc, opacities, scales, rotations), axis=1)
         elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, 'vertex') # writing elements of gaussians, representing a single instance.
+        el = PlyElement.describe(elements, 'vertex')  # writing elements of gaussians, representing a single instance.
 
         PlyData([el]).write(path)
 

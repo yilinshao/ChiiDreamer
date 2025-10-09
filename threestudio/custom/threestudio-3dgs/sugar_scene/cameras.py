@@ -8,11 +8,11 @@ from PIL import Image
 from pytorch3d.renderer import FoVPerspectiveCameras as P3DCameras
 from pytorch3d.renderer.cameras import _get_sfm_calibration_matrix
 
-from sugar_utils.graphics_utils import focal2fov, fov2focal, getWorld2View2, getProjectionMatrix
-from sugar_utils.general_utils import PILtoTorch
+from ..utils.sugar_utils.graphics_utils import focal2fov, fov2focal, getWorld2View2, getProjectionMatrix
+from ..utils.sugar_utils.general_utils import PILtoTorch
 
 
-def load_gs_cameras(source_path, gs_output_path, image_resolution=1, 
+def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
                     load_gt_images=True, max_img_size=1920, dataset_name="relight3d"):
     """Loads Gaussian Splatting camera parameters from a COLMAP reconstruction.
 
@@ -46,23 +46,23 @@ def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
         print(f"Warning: image extension {extension} not supported.")
     else:
         print(f"Found image extension {extension}")
-    
+
     for cam_idx in range(len(camera_transforms)):
         camera_transform = camera_transforms[cam_idx]
-        
+
         # Extrinsics
         rot = np.array(camera_transform['rotation'])
         pos = np.array(camera_transform['position'])
-        
+
         W2C = np.zeros((4,4))
         W2C[:3, :3] = rot
         W2C[:3, 3] = pos
         W2C[3,3] = 1
-        
+
         Rt = np.linalg.inv(W2C)
         T = Rt[:3, 3]
         R = Rt[:3, :3].transpose()
-        
+
         # Intrinsics
         width = camera_transform['width']
         height = camera_transform['height']
@@ -70,7 +70,7 @@ def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
         fx = camera_transform['fx']
         fov_y = focal2fov(fy, height)
         fov_x = focal2fov(fx, width)
-        
+
         # GT data
         id = camera_transform['id']
         name = camera_transform['img_name']
@@ -80,7 +80,7 @@ def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
             else:
                 image_dir = os.path.join(source_path, 'train')
         image_path = os.path.join(image_dir,  name + extension)
-        
+
         if load_gt_images:
             image = Image.open(image_path)
             orig_w, orig_h = image.size
@@ -94,7 +94,7 @@ def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
             resolution = round(orig_w/(downscale_factor)), round(orig_h/(downscale_factor))
             resized_image_rgb = PILtoTorch(image, resolution)
             gt_image = resized_image_rgb[:3, ...]
-            
+
             image_height, image_width = None, None
         else:
             gt_image = None
@@ -105,13 +105,13 @@ def load_gs_cameras(source_path, gs_output_path, image_resolution=1,
                 additional_downscale_factor = max(height, width) / max_img_size
                 downscale_factor = additional_downscale_factor * downscale_factor
             image_height, image_width = round(height/downscale_factor), round(width/downscale_factor)
-        
+
         gs_camera = GSCamera(
             colmap_id=id, image=gt_image, gt_alpha_mask=None,
             R=R, T=T, FoVx=fov_x, FoVy=fov_y,
             image_name=name, uid=id,
             image_height=image_height, image_width=image_width,)
-        
+
         cam_list.append(gs_camera)
 
     return cam_list
@@ -168,7 +168,7 @@ class GSCamera(torch.nn.Module):
             else:
                 self.image_height = image_height
                 self.image_width = image_width
-        else:        
+        else:
             self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
             self.image_width = self.original_image.shape[2]
             self.image_height = self.original_image.shape[1]
@@ -188,11 +188,11 @@ class GSCamera(torch.nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
-        
+
     @property
     def device(self):
         return self.world_view_transform.device
-    
+
     def to(self, device):
         self.world_view_transform = self.world_view_transform.to(device)
         self.projection_matrix = self.projection_matrix.to(device)
@@ -200,7 +200,7 @@ class GSCamera(torch.nn.Module):
         self.camera_center = self.camera_center.to(device)
         return self
 
-    
+
 def create_p3d_cameras(R=None, T=None, K=None, znear=0.0001):
     """Creates pytorch3d-compatible camera object from R, T, K matrices.
 
@@ -217,13 +217,13 @@ def create_p3d_cameras(R=None, T=None, K=None, znear=0.0001):
         R = torch.eye(3)[None]
     if T is None:
         T = torch.zeros(3)[None]
-        
+
     if K is not None:
         p3d_cameras = P3DCameras(R=R, T=T, K=K, znear=0.0001)
     else:
         p3d_cameras = P3DCameras(R=R, T=T, znear=0.0001)
         p3d_cameras.K = p3d_cameras.get_projection_transform().get_matrix().transpose(-1, -2)
-        
+
     return p3d_cameras
 
 
@@ -239,9 +239,9 @@ def convert_camera_from_gs_to_pytorch3d(gs_cameras, device='cuda'):
     Returns:
         p3d_cameras: pytorch3d-compatible camera object.
     """
-    
+
     N = len(gs_cameras)
-    
+
     R = torch.Tensor(np.array([gs_camera.R for gs_camera in gs_cameras])).to(device)
     T = torch.Tensor(np.array([gs_camera.T for gs_camera in gs_cameras])).to(device)
     fx = torch.Tensor(np.array([fov2focal(gs_camera.FoVx, gs_camera.image_width) for gs_camera in gs_cameras])).to(device)
@@ -250,16 +250,16 @@ def convert_camera_from_gs_to_pytorch3d(gs_cameras, device='cuda'):
     image_width = torch.tensor(np.array([gs_camera.image_width for gs_camera in gs_cameras]), dtype=torch.int).to(device)
     cx = image_width / 2.  # torch.zeros_like(fx).to(device)
     cy = image_height / 2.  # torch.zeros_like(fy).to(device)
-    
+
     w2c = torch.zeros(N, 4, 4).to(device)
     w2c[:, :3, :3] = R.transpose(-1, -2)
     w2c[:, :3, 3] = T
     w2c[:, 3, 3] = 1
-    
+
     c2w = w2c.inverse()
     c2w[:, :3, 1:3] *= -1
     c2w = c2w[:, :3, :]
-    
+
     distortion_params = torch.zeros(N, 6).to(device)
     camera_type = torch.ones(N, 1, dtype=torch.int32).to(device)
 
@@ -272,17 +272,8 @@ def convert_camera_from_gs_to_pytorch3d(gs_cameras, device='cuda'):
     ].to(device)
     scale = image_size.min(dim=1, keepdim=True)[0] / 2.0
     c0 = image_size / 2.0
-    p0_pytorch3d = (
-        -(
-            torch.Tensor(
-                (cx[0], cy[0]),
-            )[
-                None
-            ].to(device)
-            - c0
-        )
-        / scale
-    )
+    p0_pytorch3d = -(torch.Tensor((cx[0], cy[0]),)[None].to(device) - c0) / scale
+
     focal_pytorch3d = (
         torch.Tensor([fx[0], fy[0]])[None].to(device) / scale
     )
@@ -353,9 +344,9 @@ def convert_camera_from_pytorch3d_to_gs(
     K_inv = p3d_cameras.K[0] * scale
     fx_inv, fy_inv = K_inv[0, 0], K_inv[1, 1]
     cx_inv, cy_inv = c0[0, 0] - K_inv[0, 2], c0[0, 1] - K_inv[1, 2]
-    
+
     gs_cameras = []
-    
+
     for cam_idx in range(N):
         # NeRF 'transform_matrix' is a camera-to-world transform
         c2w = camera_to_worlds_inv[cam_idx]
@@ -367,25 +358,25 @@ def convert_camera_from_pytorch3d_to_gs(
         w2c = np.linalg.inv(c2w)
         R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
         T = w2c[:3, 3]
-        
+
         image_height=height
         image_width=width
-        
+
         fx = fx_inv.item()
         fy = fy_inv.item()
         fovx = focal2fov(fx, image_width)
         fovy = focal2fov(fy, image_height)
 
-        FovY = fovy 
+        FovY = fovy
         FovX = fovx
-        
+
         name = 'image_' + str(cam_idx)
-        
+
         camera = GSCamera(
             colmap_id=cam_idx, image=None, gt_alpha_mask=None,
             R=R, T=T, FoVx=FovX, FoVy=FovY,
             image_name=name, uid=cam_idx,
-            image_height=image_height, 
+            image_height=image_height,
             image_width=image_width,
             )
         gs_cameras.append(camera)
@@ -394,7 +385,7 @@ def convert_camera_from_pytorch3d_to_gs(
 
 
 class CamerasWrapper:
-    """Class to wrap Gaussian Splatting camera parameters 
+    """Class to wrap Gaussian Splatting camera parameters
     and facilitates both usage and integration with PyTorch3D.
     """
     def __init__(
@@ -417,11 +408,11 @@ class CamerasWrapper:
         """
 
         self.gs_cameras = gs_cameras
-        
+
         self._p3d_cameras = p3d_cameras
         self._p3d_cameras_computed = p3d_cameras_computed
-        
-        device = gs_cameras[0].device        
+
+        device = gs_cameras[0].device
         N = len(gs_cameras)
         R = torch.Tensor(np.array([gs_camera.R for gs_camera in gs_cameras])).to(device)
         T = torch.Tensor(np.array([gs_camera.T for gs_camera in gs_cameras])).to(device)
@@ -431,12 +422,12 @@ class CamerasWrapper:
         self.width = torch.tensor(np.array([gs_camera.image_width for gs_camera in gs_cameras]), dtype=torch.int).to(device)
         self.cx = self.width / 2.  # torch.zeros_like(fx).to(device)
         self.cy = self.height / 2.  # torch.zeros_like(fy).to(device)
-        
+
         w2c = torch.zeros(N, 4, 4).to(device)
         w2c[:, :3, :3] = R.transpose(-1, -2)
         w2c[:, :3, 3] = T
         w2c[:, 3, 3] = 1
-        
+
         c2w = w2c.inverse()
         c2w[:, :3, 1:3] *= -1
         c2w = c2w[:, :3, :]
@@ -499,7 +490,7 @@ class CamerasWrapper:
         self.cy = self.cy.to(device)
         self.width = self.width.to(device)
         self.height = self.height.to(device)
-        
+
         for gs_camera in self.gs_cameras:
             gs_camera.to(device)
 
@@ -507,9 +498,9 @@ class CamerasWrapper:
             self._p3d_cameras = self._p3d_cameras.to(device)
 
         return self
-        
+
     def get_spatial_extent(self):
-        """Returns the spatial extent of the cameras, computed as 
+        """Returns the spatial extent of the cameras, computed as
         the extent of the bounding box containing all camera centers.
 
         Returns:
@@ -521,4 +512,3 @@ class CamerasWrapper:
 
         radius = 1.1 * half_diagonal
         return radius
-    

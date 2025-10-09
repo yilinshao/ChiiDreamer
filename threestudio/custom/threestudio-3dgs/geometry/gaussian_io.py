@@ -87,26 +87,24 @@ class GaussianIO:
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
-    def load_ply(self, path):
+    def load_ply(self, path, for_layout=False):
         plydata = PlyData.read(path)
-
-        # xyz = np.stack(
-        #     (
-        #         np.asarray(plydata.elements[0]["x"]),
-        #         np.asarray(plydata.elements[0]["y"]),
-        #         np.asarray(plydata.elements[0]["z"]),
-        #     ),
-        #     axis=1,
-        # )
-
-        xyz = np.stack(
-            (
-                np.asarray(plydata.elements[0]["z"]),
-                np.asarray(plydata.elements[0]["x"]),
-                np.asarray(plydata.elements[0]["y"]),
-            ),
-            axis=1,
-        )
+        if not for_layout:
+            xyz = np.stack(
+                (
+                    np.asarray(plydata.elements[0]["x"]),
+                    np.asarray(plydata.elements[0]["y"]),
+                    np.asarray(plydata.elements[0]["z"]),
+                ),
+                axis=1
+            )
+        else:
+            xyz = np.stack(
+                (
+                    np.asarray(plydata.elements[0]["z"]),
+                    np.asarray(plydata.elements[0]["x"]),
+                    np.asarray(plydata.elements[0]["y"]),
+                ), axis=1)
 
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
