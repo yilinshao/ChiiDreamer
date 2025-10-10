@@ -162,9 +162,9 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # init SDF
         self.sugar.part_num = 1
         sugar_checkpoint_path = '.'  # fixme: redundant, checkpoint will not be set here
-        self.sugar.neus = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
+        self.sugar.neus_0 = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
         # TODO: for objects_i in range(len(self.prompt_processor_list) - 2):
-        self.sugar.sdf_0 = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
+        self.sugar.neus_1 = Runner(sugar_checkpoint_path, None, part_num=self.sugar.part_num)
 
         print(f'\nSuGaR model has been initialized.')
         print(f'Number of parameters: {sum(p.numel() for p in self.sugar.parameters() if p.requires_grad)}')
@@ -178,7 +178,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # ====================Initialize optimizer====================
         spatial_lr_scale = cameras_spatial_extent
         print("Using camera spatial extent as spatial_lr_scale:", spatial_lr_scale)
-        position_lr_init = 0.000016
+        position_lr_init = 0.00016
         position_lr_final = 0.0000016
         position_lr_delay_mult = 0.01
         position_lr_max_steps = 1600
@@ -346,10 +346,13 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         }
 
     def configure_optimizers(self):
-        optim = self.geometry.optimizer
+        optim = self.sugar_optimizer.get_optimizer
+        self.merged_optimizer = True
+        # optim = self.geometry.optimizer
         if hasattr(self, "merged_optimizer"):
             return [optim]
         if hasattr(self.cfg.optimizer, "name"):
+            # if certain param (except the 3DGS) are required to optimize, then put them in the net optim, then merge
             net_optim = parse_optimizer(self.cfg.optimizer, self)
             optim = self.geometry.merge_optimizer(net_optim)
             self.merged_optimizer = True
@@ -357,13 +360,13 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             self.merged_optimizer = False
         return [optim]
 
-    def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
-
+    def on_train_batch_start(self, batch, batch_idx):
         # Update learning rates
-        # if self.global_step >= 9000:
-
         udfnet_lr = self.sugar.neus.get_learning_rate_at_iteration(self.global_step, max_iter=1600)
         self.sugar_optimizer.update_learning_rate(self.global_step, sdfnet_lr=udfnet_lr)
+
+    def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
+
 
         # rasterizer setting
         current_sh_levels = sh_levels = 4
@@ -429,48 +432,14 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             render_instance_id = instance_id
         # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
 
-        opt = self.optimizers()
-        out = self(batch, render_instance_id)  # outputs.
-        visibility_filter = out["visibility_filter"]
-        radii = out["radii"]
-        guidance_inp = out["comp_rgb"]
-        viewspace_point_tensor = out["viewspace_points"]
-
-        guidance_out = self.guidance(
-            guidance_inp,
-            prompt_utils,
-            **batch,
-            rgb_as_latents=False
-        )
-
-        loss_sds = 0.0
-        loss = 0.0
-
-        self.log(
-            "gauss_num",
-            int(self.sugar.points.shape[0]),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        # sds loss
-        for name, value in guidance_out.items():
-            self.log(f"train/{name}", value)
-            if name.startswith("loss_"):
-                loss_sds += value * self.C(
-                    self.cfg.loss[name.replace("loss_", "lambda_")]
-                )
-
         # step: sdf loss
+        loss_sdf = 0.0
         # if iteration > 7000
-        has_not_pruned = True
         prune_hard_opacity_threshold = 0.05
         sugar_checkpoint_path = os.path.join(self.get_save_dir(), 'sugar')
 
         # step: prune the gaussian before sdf loss
-        if self.global_step == 0 and has_not_pruned:
+        if self.global_step == 0:
             print("Prunning Pointcloud Using Opacity...")
             prune_mask = (self.gaussian_densifier.model.strengths < prune_hard_opacity_threshold).squeeze()
             self.gaussian_densifier.prune_points(prune_mask)
@@ -480,12 +449,11 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             self.sugar.neus.reset_datasets(
                 sugar_checkpoint_path,
                 self.sugar.points.detach().cpu().numpy(),
-                iteration=9000,
+                iteration=self.global_step,
                 scene_name='threestudio')
-            has_not_pruned = False
 
-        # step: reset dataset every 1000 iter
-        if self.global_step % 1000 == 0 and self.global_step != self.last_resample_iteration and self.global_step > 9500:
+        # reset dataset every 500 iter
+        if self.global_step % 500 == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
             if self.global_step % 2000 == 0:
                 print('Recalculating Sample Points...')
                 self.sugar.neus.reset_datasets(
@@ -510,7 +478,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
                 clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-4)
                 scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
-                loss = loss + 100 * scaling_loss
+                loss_sdf = loss_sdf + 100 * scaling_loss
 
             # pulling loss
             train_sdf = True  # fixme: fixed condition
@@ -549,14 +517,14 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
                 neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
                 neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
-                if self.global_step > 10000:
+                if self.global_step > -1:
                     sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
                 else:
                     sdf_loss2 = 0.
-                sdf_loss = 1.0 * sdf_loss1 + 1.0 * sdf_loss2
+                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
 
                 # ours: pull gs
-                if self.global_step > 10000:  # delay for very large scene
+                if self.global_step > -1:  # delay for very large scene
                     rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
                     _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
                     _udf_sample = sdf_network.sdf(rescaled_sugar_points)
@@ -565,15 +533,13 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                     sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
                     sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
                                                    dim=-1).mean()
-                    sdf_loss = sdf_loss + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
-
-                loss = loss + sdf_loss
+                    loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
 
                 # norm consistency
                 train_normal = True  # fixme
                 if train_normal:
                     assert train_sdf, 'require train_sdf=True for train_normal!'
-                    if self.global_step > 10000:   # delay for very large scene
+                    if self.global_step > -1:   # delay for very large scene
                         sugar_normals = self.sugar.get_normals()[batch_selected_idx]
                         surf_normals = _grad_norm.detach()
                         sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
@@ -586,141 +552,102 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
                         normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
 
-                        loss = loss + normal_loss
+                        loss_sdf = loss_sdf + normal_loss
 
+        train_sds_loss = False
+        # start computing sds loss
+        if train_sds_loss:
+            loss_sds = 0.0
+
+            out = self(batch, render_instance_id)  # outputs.
+
+            visibility_filter = out["visibility_filter"]
+            radii = out["radii"]
+            guidance_inp = out["comp_rgb"]
+            viewspace_point_tensor = out["viewspace_points"]
+
+            guidance_out = self.guidance(
+                guidance_inp,
+                prompt_utils,
+                **batch,
+                rgb_as_latents=False
+            )
+
+            self.log("gauss_num", int(self.sugar.points.shape[0]), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+            # sds loss
+            for name, value in guidance_out.items():
+                self.log(f"train/{name}", value)
+                if name.startswith("loss_"):
+                    loss_sds += value * self.C(self.cfg.loss[name.replace("loss_", "lambda_")])
+
+        train_gaussian_loss = False
         # gaussian related losses
+        if train_gaussian_loss:
+            loss_gs = 0.0
+            if self.cfg.loss["lambda_position"] > 0.0:
+                xyz_mean = self.sugar.points.norm(dim=-1)
+                loss_position = xyz_mean.mean()
+                self.log(f"train/loss_position", loss_position)
+                loss_gs += self.C(self.cfg.loss["lambda_position"]) * loss_position
 
-        xyz_mean = None
-        if self.cfg.loss["lambda_position"] > 0.0:
-            xyz_mean = self.sugar.points.norm(dim=-1)
-            loss_position = xyz_mean.mean()
-            self.log(f"train/loss_position", loss_position)
-            loss += self.C(self.cfg.loss["lambda_position"]) * loss_position
+            if self.cfg.loss["lambda_opacity"] > 0.0:
+                scaling = self.sugar.scaling.norm(dim=-1)
+                loss_opacity = (
+                    scaling.detach().unsqueeze(-1) * self.geometry.get_opacity
+                ).sum()
+                self.log(f"train/loss_opacity", loss_opacity)
+                loss_gs += self.C(self.cfg.loss["lambda_opacity"]) * loss_opacity
 
-        if self.cfg.loss["lambda_opacity"] > 0.0:
-            scaling = self.sugar.scaling.norm(dim=-1)
-            loss_opacity = (
-                scaling.detach().unsqueeze(-1) * self.geometry.get_opacity
-            ).sum()
-            self.log(f"train/loss_opacity", loss_opacity)
-            loss += self.C(self.cfg.loss["lambda_opacity"]) * loss_opacity
+            if self.cfg.loss["lambda_sparsity"] > 0.0:
+                loss_sparsity = -(self.sugar.strengths - 0.5).pow(2).mean()
+                self.log("train/loss_sparsity", loss_sparsity)
+                loss_gs += loss_sparsity * self.C(self.cfg.loss.lambda_sparsity)
 
-        if self.cfg.loss["lambda_sparsity"] > 0.0:
-            loss_sparsity = -(self.sugar.strengths - 0.5).pow(2).mean()
-            self.log("train/loss_sparsity", loss_sparsity)
-            loss += loss_sparsity * self.C(self.cfg.loss.lambda_sparsity)
+            if self.cfg.loss["lambda_scales"] > 0.0:
+                scale_sum = torch.sum(self.sugar.scaling)
+                self.log(f"train/scales", scale_sum)
+                loss_gs += self.C(self.cfg.loss["lambda_scales"]) * scale_sum
 
-        if self.cfg.loss["lambda_scales"] > 0.0:
-            scale_sum = torch.sum(self.sugar.scaling)
-            self.log(f"train/scales", scale_sum)
-            loss += self.C(self.cfg.loss["lambda_scales"]) * scale_sum
-
-        if self.cfg.loss["lambda_tv_loss"] > 0.0:
-            loss_tv = self.C(self.cfg.loss["lambda_tv_loss"]) * tv_loss(
-                out["comp_rgb"].permute(0, 3, 1, 2)
-            )
-            self.log(f"train/loss_tv", loss_tv)
-            loss += loss_tv
-
-        # =========== Normal losses =========== #
-
-        if (
-            out.__contains__("comp_depth")
-            and self.cfg.loss["lambda_depth_tv_loss"] > 0.0
-        ):
-            loss_depth_tv = self.C(self.cfg.loss["lambda_depth_tv_loss"]) * (
-                tv_loss(out["comp_normal"].permute(0, 3, 1, 2))
-                + tv_loss(out["comp_depth"].permute(0, 3, 1, 2))
-            )
-            self.log(f"train/loss_depth_tv", loss_depth_tv)
-            loss += loss_depth_tv
-
-        if self.cfg.loss["lambda_normal_smooth_loss"] > 0.0:
-            if "comp_normal" not in out:
-                raise ValueError(
-                    "comp_normal is required for 2D normal smooth loss, no comp_normal is found in the output."
+            if self.cfg.loss["lambda_tv_loss"] > 0.0:
+                assert train_sds_loss
+                loss_tv = self.C(self.cfg.loss["lambda_tv_loss"]) * tv_loss(
+                    out["comp_rgb"].permute(0, 3, 1, 2)
                 )
-            normal = out["comp_normal"]
-            loss_normal_smooth = self.C(self.cfg.loss["lambda_normal_smooth_loss"]) * ((normal[:, 1:, :, :] - normal[
-                                                                                                                 :, :-1,
-                                                                                                                 :,
-                                                                                                                 :]).square().mean() \
-                                                                                       + (normal[:, :, 1:, :] - normal[
-                                                                                                                :, :,
-                                                                                                                :-1,
-                                                                                                                :]).square().mean())
-            self.log(f"train/loss_normal_smooth", loss_normal_smooth)
-            loss += loss_normal_smooth
+                self.log(f"train/loss_tv", loss_tv)
+                loss_gs += loss_tv
 
-        # =========== Normal losses =========== #
+            # =========== Normal losses =========== #
 
-        # =========== Layout refinement losses =========== #
-        loss_layout = 0.0
-        loss_ref = 0.0
-        loss_collision = 0.0
-        # reference loss
-        if self.cfg.loss['lambda_feat_recon_loss'] > 0.0:
-            out_frontal = self(self.frontal_batch)
-            front_view = out_frontal["comp_rgb"]  # in torch format
-            # front_mask = out_frontal["mask"]
+            if (
+                out.__contains__("comp_depth")
+                and self.cfg.loss["lambda_depth_tv_loss"] > 0.0
+            ):
+                loss_depth_tv = self.C(self.cfg.loss["lambda_depth_tv_loss"]) * (
+                    tv_loss(out["comp_normal"].permute(0, 3, 1, 2))
+                    + tv_loss(out["comp_depth"].permute(0, 3, 1, 2))
+                )
+                self.log(f"train/loss_depth_tv", loss_depth_tv)
+                loss_gs += loss_depth_tv
 
-            sav = (front_view * 256)[0].detach().cpu().numpy().astype(np.uint8)
-            pil_image = Image.fromarray(sav)
-            pil_image.save('./custom/threestudio-3dgs/render.png')
+            if self.cfg.loss["lambda_normal_smooth_loss"] > 0.0:
+                if "comp_normal" not in out:
+                    raise ValueError(
+                        "comp_normal is required for 2D normal smooth loss, no comp_normal is found in the output."
+                    )
+                normal = out["comp_normal"]
+                loss_normal_smooth = self.C(
+                    self.cfg.loss["lambda_normal_smooth_loss"]) * (
+                    (normal[:, 1:, :, :] - normal[:, :-1, :, :]).square().mean() + ( \
+                    normal[:, :, 1:, :] - normal[:, :, :-1, :]).square().mean())
+                self.log(f"train/loss_normal_smooth", loss_normal_smooth)
+                loss_gs += loss_normal_smooth
 
-            with torch.no_grad():  #disable DINOv2 update
-                outputs2 = self.feat_model(pixel_values=front_view.permute(0, 3, 1, 2))
-            image_features_rendered = outputs2.last_hidden_state[0, 1:, ...]
-            # Here apply feature level L2 loss, mean
-            loss_ref = self.L2_loss(image_features_rendered.view(-1), self.image_features_ref.view(-1)) * self.cfg.loss[
-                'lambda_feat_recon_loss']
-            self.log(f"train/loss_reference", loss_ref)
-            loss_layout += loss_ref
+            # =========== Normal losses =========== #
+            for name, value in self.cfg.loss.items():
+                self.log(f"train_params/{name}", self.C(value))
 
-        # collision loss
-        if self.cfg.loss['lambda_collision'] > 0.0 and self.global_step % 5 == 0:
-            samples = list(range(self.geometry.num_layouts))
-            selected_instance_nums = random.sample(samples, 2)
-
-            means3D = self.geometry.get_xyz * 1.0
-            if self.geometry.cfg.optimize_layout:
-                means3D[..., 0] = means3D[..., 0] + torch.repeat_interleave(self.geometry.get_layout_depths,
-                                                                            self.geometry.mark_instances)
-            # in a true iteration only sample two instances.
-            if selected_instance_nums[0] == 0:
-                pc1 = means3D[: self.mark_accum[0]]
-            else:
-                i = selected_instance_nums[0]
-                pc1 = means3D[self.mark_accum[i - 1]: self.mark_accum[i]]
-
-            if selected_instance_nums[1] == 0:
-                pc2 = means3D[: self.mark_accum[0]]
-            else:
-                i = selected_instance_nums[1]
-                pc2 = means3D[self.mark_accum[i - 1]: self.mark_accum[i]]
-
-            mean_pc2 = torch.mean(pc2, dim=0)
-            # pc1 - pc2_m - sp2 + 0.5sp1 , moderate tolerance.
-
-            dist_inter = torch.norm(pc1 - mean_pc2, dim=-1, keepdim=True) - \
-                         self.disparity_lst[selected_instance_nums[1]]  # + \
-            # 0.5 * self.disparity_lst[selected_instance_nums[0]] \
-
-            hinge_distances = F.relu(-dist_inter)
-            # annealing strategy.
-            loss_collision = torch.sum(hinge_distances) * self.cfg.loss['lambda_collision'] * (
-                1 - self.global_step / self.trainer.max_steps)
-            self.log(f"train/loss_collision", loss_collision)
-            loss_layout += loss_collision
-
-        if loss_layout > 0.0:
-            loss_layout.backward(retain_graph=True)
-        # =========== Layout refinement losses =========== #
-
-        for name, value in self.cfg.loss.items():
-            self.log(f"train_params/{name}", self.C(value))
-
-        # # syl =================================== find instance filter
+        #  find instance filter
         # # instance_filter = torch.zeros(self.geometry.get_xyz.shape[0], device=self.geometry.get_xyz.device)
         # instance_filter = torch.zeros(self.sugar.points.shape[0], device=self.sugar.points.device)
         # mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
@@ -734,7 +661,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # for i, view_filter in enumerate(visibility_filter):  # MV dream has 4 views (seems they are all the same)
         #     visibility_filter[i] = view_filter & (instance_filter != 0)
 
-        loss_sds.backward(retain_graph=True)
+        # loss_sds.backward(retain_graph=True)
         iteration = self.global_step
 
         # self.geometry.update_states(
@@ -743,9 +670,12 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         #     radii,
         #     viewspace_point_tensor,
         # )
+        if train_sds_loss:
+            loss_sds.backward(retain_graph=True)
+        if train_gaussian_loss > 0:
+            loss_gs.backward()
 
-        if loss > 0:
-            loss.backward()
+        loss_sdf.backward()
 
         # step: 清除其他inst的梯度
         # if instance_id != -1:
@@ -755,13 +685,16 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         #     else:
         #         instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
         #     zero_grad_inst(self.geometry, instance_range)
+        # opt.step()
+        # opt.zero_grad(set_to_none=True)
+
+        # optimizer 返回是list吗?
+        opt = self.optimizers()
+
         opt.step()
         opt.zero_grad(set_to_none=True)
 
-        self.sugar_optimizer.step()
-        self.sugar_optimizer.zero_grad(set_to_none = True)
-
-        return {"loss": loss_sds}
+        return {"loss": loss_sdf}
 
     def validation_step(self, batch, batch_idx):
 

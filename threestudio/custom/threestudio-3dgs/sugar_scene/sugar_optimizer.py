@@ -77,10 +77,16 @@ class SuGaROptimizer:
             l = l + [{'params': [model._scales], 'lr': opt.scaling_lr, "name": "scales"}]
         if (model.binded_to_surface_mesh and model.learn_surface_mesh_scales) or (not model.binded_to_surface_mesh and model.learn_quaternions):
             l = l + [{'params': [model._quaternions], 'lr': opt.rotation_lr, "name": "quaternions"}]
-        # ours: +np
+
+        # TODO: for neus_idx in range(neus_number)
         for i in range(1, model.part_num + 1):
-            sdf_network = getattr(model.neus, 'sdf_network'+str(i))
-            l = l + [{'params': list(sdf_network.parameters()), 'lr': 1e-4, "name": "sdfnetwork"+str(i)}]
+            sdf_network = getattr(model.neus_0, 'sdf_network'+str(i))
+            l = l + [{'params': list(sdf_network.parameters()), 'lr': 1e-4, "name": "neus0_sdfnetwork"+str(i)}]
+
+        for i in range(1, model.part_num + 1):
+            sdf_network = getattr(model.neus_1, 'sdf_network'+str(i))
+            l = l + [{'params': list(sdf_network.parameters()), 'lr': 1e-4, "name": "neus1_sdfnetwork"+str(i)}]
+
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
@@ -90,6 +96,10 @@ class SuGaROptimizer:
             lr_delay_mult=opt.position_lr_delay_mult,
             max_steps=opt.position_lr_max_steps
             )
+
+    @property
+    def get_optimizer(self):
+        return self.optimizer
 
     def step(self):
         self.optimizer.step()

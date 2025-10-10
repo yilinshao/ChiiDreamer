@@ -1266,7 +1266,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
         ):
             if self.selected_instance_id == -1:
                 for instance_id in range(self.mark_instances.shape[0]):
-                    # syl ==`================================= find instance filter
+                    # find instance filter
                     instance_filter = torch.zeros(self.get_xyz.shape[0], device=self.get_xyz.device)
                     mark_accum = torch.cumsum(self.mark_instances, dim=0)
                     if instance_id == 0:
