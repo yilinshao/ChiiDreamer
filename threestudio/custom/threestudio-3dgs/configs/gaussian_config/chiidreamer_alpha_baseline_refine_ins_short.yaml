@@ -35,8 +35,8 @@ system:
     min_opac_prune: 0.05
 
     prune_interval: 100
-    prune_from_iter: 300
-    prune_until_iter: 900
+    prune_from_iter: 200
+    prune_until_iter: 1500
 
     densification_interval: 100
     densify_from_iter: 300

@@ -441,6 +441,12 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # step: prune the gaussian before sdf loss
         if self.global_step == 0:
             print("Prunning Pointcloud Using Opacity...")
+            self.geometry._xyz = self.sugar.points
+            self.geometry._scaling = self.sugar.scaling
+            self.geometry._opacity = self.sugar.all_densities
+            vis_filter = torch.ones_like(self.geometry._xyz[0])
+            self.geometry.prune(prune_hard_opacity_threshold, vis_filter)
+
             prune_mask = (self.gaussian_densifier.model.strengths < prune_hard_opacity_threshold).squeeze()
             self.gaussian_densifier.prune_points(prune_mask)
             print('After Prunning: {} Gaussians Left.'.format(self.sugar.points.shape[0]))

@@ -884,9 +884,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
                     stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                     del self.optimizer.state[group["params"][0]]
-                    group["params"][0] = nn.Parameter(
-                        (group["params"][0][mask].requires_grad_(True))
-                    )
+                    group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                     self.optimizer.state[group["params"][0]] = stored_state
 
                     optimizable_tensors[group["name"]] = group["params"][0]
@@ -1214,9 +1212,9 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
             big_points_vs = self.max_radii2D > (torch.mean(self.max_radii2D) * 3)
             prune_mask = torch.logical_or(prune_mask, big_points_vs)
 
-        # syl===========prune only happends on the current instance
+        # syl===========prune only happens on the current instance
         prune_mask = prune_mask & (visibility_mask == 1)
-        # syl===========prune only happends on the current instance
+        # syl===========prune only happens on the current instance
 
         self.prune_points(prune_mask)
 

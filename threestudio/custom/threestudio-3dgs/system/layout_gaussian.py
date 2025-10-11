@@ -46,7 +46,7 @@ class LayoutGSSystem(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         visualize_samples: bool = False
-        gaussian_checkpoint: str = None
+        gaussian_checkpoint: str = ''
 
     cfg: Config
 
@@ -67,7 +67,7 @@ class LayoutGSSystem(BaseLift3DSystem):
         # set up geometry, material, background, renderer
         # self.pre_process_instances()
         super().configure()
-        self.load_gaussian_checkpoint(self.cfg.gaussian_checkpoint)
+        # self.load_gaussian_checkpoint(self.cfg.gaussian_checkpoint)
 
         self.automatic_optimization = False
         # self.lpips = LPIPS(net='vgg').to(self.device)
@@ -265,7 +265,7 @@ class LayoutGSSystem(BaseLift3DSystem):
         # ssyl===============select the gaussians for each instance=====>
         if len(self.prompt_utils_list) > 0:
             rand_num = np.random.rand()
-            rand_num = 0.7
+            rand_num = 0.2
             if rand_num < 0.33:
                 instance_id = 0
                 self.geometry.selected_instance_id = 0
@@ -488,7 +488,7 @@ class LayoutGSSystem(BaseLift3DSystem):
             else:
                 instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
             zero_grad_inst(self.geometry, instance_range)
-        # opt.step()
+        opt.step()
         opt.zero_grad(set_to_none=True)
 
         return {"loss": loss_sds}

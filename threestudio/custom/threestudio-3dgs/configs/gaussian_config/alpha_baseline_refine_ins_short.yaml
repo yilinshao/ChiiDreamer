@@ -32,8 +32,8 @@ system:
     rotation_lr: 0.001
     min_opac_prune: 0.05
 
-    prune_interval: 100
-    prune_from_iter: 300
+    prune_interval: 1
+    prune_from_iter: 0
     prune_until_iter: 900
 
     densification_interval: 100
