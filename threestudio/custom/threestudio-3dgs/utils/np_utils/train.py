@@ -44,23 +44,23 @@ class Runner:
 
     def reset_datasets(self, path, pointcloud, iteration=9000, scene_name='Barn'):
         for i in range(1, self.part_num + 1):
-            os.makedirs(os.path.join(path, 'query_data'), exist_ok=True)
-            dataset_path = os.path.join(path, 'query_data', 'dataset_iter{}_part{}.pt'.format(iteration, i))
-            if os.path.exists(dataset_path):
-                dataset = torch.load(dataset_path)
+            # os.makedirs(os.path.join(path, 'query_data'), exist_ok=True)
+            # dataset_path = os.path.join(path, 'query_data', 'dataset_iter{}_part{}.pt'.format(iteration, i))
+            # if os.path.exists(dataset_path):
+            #     dataset = torch.load(dataset_path)
+            # else:
+            if not isinstance(pointcloud, np.ndarray):
+                pointcloud = pointcloud.clone().detach().cpu().numpy()
+            if hasattr(self, 'dataset' + str(i)):
+                old_datset = self.__getattribute__('dataset' + str(i))
+                pc_bbx = old_datset.pc_bbx
+                shape_center = old_datset.shape_center
+                shape_scale = old_datset.shape_scale
             else:
-                if not isinstance(pointcloud, np.ndarray):
-                    pointcloud = pointcloud.clone().detach().cpu().numpy()
-                if hasattr(self, 'dataset' + str(i)):
-                    old_datset = self.__getattribute__('dataset' + str(i))
-                    pc_bbx = old_datset.pc_bbx
-                    shape_center = old_datset.shape_center
-                    shape_scale = old_datset.shape_scale
-                else:
-                    pc_bbx = shape_center = shape_scale = None
-                dataset = Dataset(pointcloud, part=i, scene_name=scene_name, old_pc_bbx=pc_bbx,
-                                            old_shape_center=shape_center, old_shape_scale=shape_scale)
-                torch.save(dataset, dataset_path)
+                pc_bbx = shape_center = shape_scale = None
+            dataset = Dataset(pointcloud, part=i, scene_name=scene_name, old_pc_bbx=pc_bbx,
+                                        old_shape_center=shape_center, old_shape_scale=shape_scale)
+                # torch.save(dataset, dataset_path)
             self.__setattr__('dataset' + str(i), dataset)
 
 

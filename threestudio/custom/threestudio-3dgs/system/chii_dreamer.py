@@ -182,9 +182,9 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         position_lr_final = 0.0000016
         position_lr_delay_mult = 0.01
         position_lr_max_steps = 1600
-        feature_lr = 0.0025
+        feature_lr = 0.0005
         opacity_lr = 0.05
-        scaling_lr = 0.0005
+        scaling_lr = 0.5
         rotation_lr = 0.001
 
         opt_params = OptimizationParams(
@@ -362,11 +362,10 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
     def on_train_batch_start(self, batch, batch_idx):
         # Update learning rates
-        udfnet_lr = self.sugar.neus.get_learning_rate_at_iteration(self.global_step, max_iter=1600)
+        udfnet_lr = self.sugar.neus_0.get_learning_rate_at_iteration(self.global_step, max_iter=1600)
         self.sugar_optimizer.update_learning_rate(self.global_step, sdfnet_lr=udfnet_lr)
 
     def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
-
 
         # rasterizer setting
         current_sh_levels = sh_levels = 4
@@ -435,38 +434,59 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # step: sdf loss
         loss_sdf = 0.0
         # if iteration > 7000
-        prune_hard_opacity_threshold = 0.05
+        prune_hard_opacity_threshold = -0.1
         sugar_checkpoint_path = os.path.join(self.get_save_dir(), 'sugar')
 
-        # step: prune the gaussian before sdf loss
-        if self.global_step == 0:
-            print("Prunning Pointcloud Using Opacity...")
-            self.geometry._xyz = self.sugar.points
-            self.geometry._scaling = self.sugar.scaling
-            self.geometry._opacity = self.sugar.all_densities
-            vis_filter = torch.ones_like(self.geometry._xyz[0])
-            self.geometry.prune(prune_hard_opacity_threshold, vis_filter)
+        mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
+        obj_mask = []
+        obj_1_mask = torch.zeros(self.sugar.points.shape[0])
+        obj_2_mask = torch.zeros(self.sugar.points.shape[0])
+        obj_1_mask[0: mark_accum[0]] = 1
+        obj_mask.append(obj_1_mask.to(torch.bool))
+        obj_2_mask[mark_accum[0]: mark_accum[1]] = 1
+        obj_mask.append(obj_2_mask.to(torch.bool))
 
+        # step: setup dataset, prune the gaussian before sdf loss
+        if self.global_step == 0:
+            # TODO: not pruned
+            print("Prunning Pointcloud Using Opacity...")
             prune_mask = (self.gaussian_densifier.model.strengths < prune_hard_opacity_threshold).squeeze()
             self.gaussian_densifier.prune_points(prune_mask)
             print('After Prunning: {} Gaussians Left.'.format(self.sugar.points.shape[0]))
 
             self.sugar.visual_point_cloud(iteration=9001, checkpoint_path=sugar_checkpoint_path)
-            self.sugar.neus.reset_datasets(
+
+            # setup dataset
+            obj_0_points = self.sugar.points[0: mark_accum[0]].detach().cpu().numpy()
+            self.sugar.neus_0.reset_datasets(
                 sugar_checkpoint_path,
-                self.sugar.points.detach().cpu().numpy(),
+                obj_0_points,
+                iteration=self.global_step,
+                scene_name='threestudio')
+
+            obj_1_points = self.sugar.points[mark_accum[0]: mark_accum[1]].detach().cpu().numpy()
+            self.sugar.neus_1.reset_datasets(
+                sugar_checkpoint_path,
+                obj_1_points,
                 iteration=self.global_step,
                 scene_name='threestudio')
 
         # reset dataset every 500 iter
         if self.global_step % 500 == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
-            if self.global_step % 2000 == 0:
-                print('Recalculating Sample Points...')
-                self.sugar.neus.reset_datasets(
-                    sugar_checkpoint_path,
-                    self.sugar.points.detach().cpu().numpy(),
-                    iteration=self.global_step,
-                    scene_name='threestudio')
+            print('Recalculating Sample Points...')
+            obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
+            self.sugar.neus_0.reset_datasets(
+                sugar_checkpoint_path,
+                obj_0_points,
+                iteration=self.global_step,
+                scene_name='threestudio')
+
+            obj_1_points = self.sugar.points[obj_mask[1]].detach().cpu().numpy()
+            self.sugar.neus_1.reset_datasets(
+                sugar_checkpoint_path,
+                obj_1_points,
+                iteration=self.global_step,
+                scene_name='threestudio')
             self.last_resample_iteration = self.global_step
 
         # step: start sdf regularization
@@ -490,75 +510,77 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             train_sdf = True  # fixme: fixed condition
             cur_part_num = 1
             if train_sdf:
-                sugar_points = self.sugar.points
-                dataset = getattr(self.sugar.neus, 'dataset' + str(cur_part_num))
-                points, samples, point_gt, points_idx = dataset.get_train_data(10000)
-                samples.requires_grad = True
+                for i in range(2):
+                    neus_model = getattr(self.sugar, f'neus_{i}')
+                    dataset = getattr(neus_model, 'dataset' + str(cur_part_num))
+                    points, samples, point_gt, points_idx = dataset.get_train_data(10000)
+                    samples.requires_grad = True
 
-                # sdf loss 1
-                sdf_network = getattr(self.sugar.neus, 'sdf_network' + str(cur_part_num))
-                gradients_sample = sdf_network.gradient(samples).squeeze()  # 5000x3
-                udf_sample = sdf_network.sdf(samples)  # 5000x1
-                grad_norm = F.normalize(gradients_sample, dim=1)  # 5000x3
-                sample_moved = samples - grad_norm * udf_sample  # 5000x3
-                # update the sdf network not the gs points
-                sdf_loss1 = self.sugar.neus.ChamferDisL1(points.unsqueeze(0), sample_moved.unsqueeze(0))
+                    # sdf loss 1
+                    sdf_network = getattr(neus_model, 'sdf_network' + str(cur_part_num))
+                    gradients_sample = sdf_network.gradient(samples).squeeze()  # 5000x3
+                    udf_sample = sdf_network.sdf(samples)  # 5000x1
+                    grad_norm = F.normalize(gradients_sample, dim=1)  # 5000x3
+                    sample_moved = samples - grad_norm * udf_sample  # 5000x3
+                    # update the sdf network not the gs points
+                    ChamferDis = getattr(neus_model, 'ChamferDisL1')
+                    sdf_loss1 = ChamferDis(points.unsqueeze(0), sample_moved.unsqueeze(0))
 
-                # sdf loss 2 = loss pull in the paper
-                scaled_sample_moved = sample_moved * dataset.shape_scale + dataset.shape_center
-                knn = knn_points(sample_moved[None], points[None], K=1)
-                knn_idx = knn.idx[0, :, 0]
-                # gaussian_inv_scaled_rotation = sugar.get_covariance(
-                #     return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=-1, enlarge_minaxis=-1)
-                gaussian_inv_scaled_rotation = self.sugar.get_covariance(
-                    return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=100,
-                    enlarge_minaxis=100)
-                batch_selected_idx = torch.arange(self.sugar.points.shape[0], device='cuda') \
-                    [dataset.part_select_idx][dataset.downsample_idx][points_idx][knn_idx]
-                closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[batch_selected_idx].detach()
-                surf_points = points[knn_idx].detach().clone() * dataset.shape_scale + dataset.shape_center
+                    # sdf loss 2 = loss pull in the paper
+                    scaled_sample_moved = sample_moved * dataset.shape_scale + dataset.shape_center
+                    knn = knn_points(sample_moved[None], points[None], K=1)
+                    knn_idx = knn.idx[0, :, 0]
+                    # gaussian_inv_scaled_rotation = sugar.get_covariance(
+                    #     return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=-1, enlarge_minaxis=-1)
+                    gaussian_inv_scaled_rotation = self.sugar.get_covariance(
+                        return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=100,
+                        enlarge_minaxis=100)[obj_mask[i]]
+                    sugar_points_idx = torch.arange(obj_mask[i].sum(), device='cuda')[dataset.part_select_idx][dataset.downsample_idx]
+                    batch_selected_idx = sugar_points_idx[points_idx][knn_idx]
+                    closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[batch_selected_idx].detach().clone()
+                    surf_points = points[knn_idx].detach().clone() * dataset.shape_scale + dataset.shape_center
 
-                shift = (
-                        scaled_sample_moved - surf_points)  # NOTE: scaled_sample_moved = q, surf_points = /mu_j (no gradient, updating the sdf)
-                warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
-                neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
-                neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
-                if self.global_step > -1:
-                    sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
-                else:
-                    sdf_loss2 = 0.
-                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
+                    shift = (
+                            scaled_sample_moved - surf_points)  # NOTE: scaled_sample_moved = q, surf_points = /mu_j (no gradient, updating the sdf)
+                    warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
+                    neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
+                    neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
+                    if self.global_step > -1:
+                        sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
+                    else:
+                        sdf_loss2 = 0.
+                    loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
 
-                # ours: pull gs
-                if self.global_step > -1:  # delay for very large scene
-                    rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
-                    _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
-                    _udf_sample = sdf_network.sdf(rescaled_sugar_points)
-                    _grad_norm = F.normalize(_gradients_sample, dim=1)  #
-                    rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
-                    sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
-                    sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
-                                                   dim=-1).mean()
-                    loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
+                    # ours: pull gs
+                    if self.global_step > -1:  # delay for very large scene
+                        rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
+                        _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
+                        _udf_sample = sdf_network.sdf(rescaled_sugar_points)
+                        _grad_norm = F.normalize(_gradients_sample, dim=1)  #
+                        rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
+                        sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
+                        sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
+                                                       dim=-1).mean()
+                        loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
 
-                # norm consistency
-                train_normal = True  # fixme
-                if train_normal:
-                    assert train_sdf, 'require train_sdf=True for train_normal!'
-                    if self.global_step > -1:   # delay for very large scene
-                        sugar_normals = self.sugar.get_normals()[batch_selected_idx]
-                        surf_normals = _grad_norm.detach()
-                        sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
+                    # norm consistency
+                    train_normal = True  # fixme
+                    if train_normal:
+                        assert train_sdf, 'require train_sdf=True for train_normal!'
+                        if self.global_step > -1:   # delay for very large scene
+                            sugar_normals = self.sugar.get_normals()[batch_selected_idx]
+                            surf_normals = _grad_norm.detach()
+                            sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
 
-                        if self.global_step > 12000:   # delay for very large scene
-                            gaussian_center_normals = sugar_normals.detach()
-                            query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  #NOTE: update sdf normal
-                        else:
-                            query_normal_loss = 0.
+                            if self.global_step > -1:   # delay for very large scene
+                                gaussian_center_normals = sugar_normals.detach()
+                                query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  #NOTE: update sdf normal
+                            else:
+                                query_normal_loss = 0.
 
-                        normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
+                            normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
 
-                        loss_sdf = loss_sdf + normal_loss
+                            loss_sdf = loss_sdf + normal_loss
 
         train_sds_loss = False
         # start computing sds loss

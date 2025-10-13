@@ -905,7 +905,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
             storage = torch.ones(
                     self.get_xyz.shape[0], dtype=torch.uint8, requires_grad=False, device="cuda"
                 )
-            storage = storage * valid_points_mask
+            storage = storage * valid_points_mask  # (1,1,1,1) * (1,1,0,1)
             mark = torch.tensor(0)
 
             for i, item in enumerate(self.mark_instances):
