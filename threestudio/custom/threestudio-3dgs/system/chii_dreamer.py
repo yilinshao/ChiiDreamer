@@ -10,7 +10,6 @@ from threestudio.systems.utils import parse_optimizer, parse_scheduler
 from threestudio.utils.loss import tv_loss
 from threestudio.utils.typing import *
 from kiui.lpips import LPIPS
-from ..utils.layout_utils import ratio, transform_gaussians, load_ply, save_ply, initialize_3d_layouts
 from transformers import AutoImageProcessor, AutoModel, AutoConfig, Dinov2Model
 from PIL import Image
 import math
@@ -60,8 +59,13 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         visualize_samples: bool = False
         gaussian_checkpoint: str = None
         start_sdf_regularization_from: int = 9000
-        reset_neighbors_every: int = 500
+        reset_neighbors_every: int = 1000
+        reset_dataset_every: int = 1000
         start_reset_neighbors_from: int = 7000
+        loss_point_diff_start: int = 1000
+        loss_point_normal_start: int = 1000
+        loss_sdf_normal_start: int = 1000
+
 
     cfg: Config
 
@@ -95,6 +99,8 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 self.cfg.prompt_processor
             )
             self.prompt_utils = self.prompt_processor()
+
+        self.obj_name_list = ['clock', 'hourglass']
 
         # init chiidreamer, first, load from gaussian checkpoint
         assert self.cfg.gaussian_checkpoint is not None
@@ -184,7 +190,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         position_lr_max_steps = 1600
         feature_lr = 0.0005
         opacity_lr = 0.05
-        scaling_lr = 0.5
+        scaling_lr = 0.005
         rotation_lr = 0.001
 
         opt_params = OptimizationParams(
@@ -223,9 +229,6 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
         self.last_resample_iteration = self.last_reset_iteration = -1
         self.start_sdf_regularization_from = self.cfg.start_sdf_regularization_from
-        # reset neighbor
-        self.reset_neighbors_every = self.cfg.reset_neighbors_every
-        self.start_reset_neighbors_from = self.cfg.start_reset_neighbors_from
 
         torch.set_rng_state(rng_state)
 
@@ -362,7 +365,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
     def on_train_batch_start(self, batch, batch_idx):
         # Update learning rates
-        udfnet_lr = self.sugar.neus_0.get_learning_rate_at_iteration(self.global_step, max_iter=1600)
+        udfnet_lr = self.sugar.neus_0.get_learning_rate_at_iteration(self.global_step, max_iter=20000)
         self.sugar_optimizer.update_learning_rate(self.global_step, sdfnet_lr=udfnet_lr)
 
     def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
@@ -435,7 +438,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         loss_sdf = 0.0
         # if iteration > 7000
         prune_hard_opacity_threshold = -0.1
-        sugar_checkpoint_path = os.path.join(self.get_save_dir(), 'sugar')
+        sugar_checkpoint_path = os.path.join(os.path.dirname(self.get_save_dir()), 'sugar')
 
         mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
         obj_mask = []
@@ -454,30 +457,36 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             self.gaussian_densifier.prune_points(prune_mask)
             print('After Prunning: {} Gaussians Left.'.format(self.sugar.points.shape[0]))
 
-            self.sugar.visual_point_cloud(iteration=9001, checkpoint_path=sugar_checkpoint_path)
+            self.sugar.visual_point_cloud(iteration=0, checkpoint_path=sugar_checkpoint_path)
+
+            loaded_gs_workdir = os.path.normpath(os.path.join(self.cfg.gaussian_checkpoint, '..', '..'))
+            print(f"The initial SDF Datasets are stored in: {loaded_gs_workdir}")
 
             # setup dataset
             obj_0_points = self.sugar.points[0: mark_accum[0]].detach().cpu().numpy()
             self.sugar.neus_0.reset_datasets(
-                sugar_checkpoint_path,
+                os.path.join(loaded_gs_workdir, 'sugar'),
                 obj_0_points,
+                self.obj_name_list[0],
                 iteration=self.global_step,
                 scene_name='threestudio')
 
             obj_1_points = self.sugar.points[mark_accum[0]: mark_accum[1]].detach().cpu().numpy()
             self.sugar.neus_1.reset_datasets(
-                sugar_checkpoint_path,
+                os.path.join(loaded_gs_workdir, 'sugar'),
                 obj_1_points,
+                self.obj_name_list[1],
                 iteration=self.global_step,
                 scene_name='threestudio')
 
         # reset dataset every 500 iter
-        if self.global_step % 500 == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
+        if self.global_step % self.cfg.reset_dataset_every == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
             print('Recalculating Sample Points...')
             obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
             self.sugar.neus_0.reset_datasets(
                 sugar_checkpoint_path,
                 obj_0_points,
+                self.obj_name_list[0],
                 iteration=self.global_step,
                 scene_name='threestudio')
 
@@ -485,6 +494,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             self.sugar.neus_1.reset_datasets(
                 sugar_checkpoint_path,
                 obj_1_points,
+                self.obj_name_list[1],
                 iteration=self.global_step,
                 scene_name='threestudio')
             self.last_resample_iteration = self.global_step
@@ -492,9 +502,9 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # step: start sdf regularization
         if self.global_step >= self.start_sdf_regularization_from:
             # reset neighbors at start and at every interval
-            if ((self.global_step >= self.start_reset_neighbors_from) and
+            if ((self.global_step >= self.cfg.start_reset_neighbors_from) and
                 ((self.global_step == self.start_sdf_regularization_from + 1) or
-                 (self.global_step % self.reset_neighbors_every == 0)) and self.global_step != self.last_reset_iteration):
+                 (self.global_step % self.cfg.reset_neighbors_every == 0)) and self.global_step != self.last_reset_iteration):
                 print("\n---INFO---\nResetting neighbors...")
                 self.sugar.reset_neighbors()
                 self.last_reset_iteration = self.global_step
@@ -502,9 +512,10 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             train_scaling = True  # fixme: fixed condition
             if train_scaling:
                 # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
-                clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-4)
+                clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-7)
                 scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
                 loss_sdf = loss_sdf + 100 * scaling_loss
+                self.log('train/scaling_loss', 100 * scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
 
             # pulling loss
             train_sdf = True  # fixme: fixed condition
@@ -549,10 +560,13 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                         sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
                     else:
                         sdf_loss2 = 0.
+
                     loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
+                    self.log('train/sdf_loss', sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
+                    self.log('train/cov_loss', sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
 
                     # ours: pull gs
-                    if self.global_step > -1:  # delay for very large scene
+                    if self.global_step > self.cfg.loss_point_diff_start:  # delay for very large scene
                         rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
                         _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
                         _udf_sample = sdf_network.sdf(rescaled_sugar_points)
@@ -562,25 +576,28 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                         sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
                                                        dim=-1).mean()
                         loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
+                        self.log('train/points_diff', 0.05 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
 
                     # norm consistency
                     train_normal = True  # fixme
                     if train_normal:
                         assert train_sdf, 'require train_sdf=True for train_normal!'
-                        if self.global_step > -1:   # delay for very large scene
+                        if self.global_step > self.cfg.loss_point_normal_start:   # delay for very large scene
                             sugar_normals = self.sugar.get_normals()[batch_selected_idx]
                             surf_normals = _grad_norm.detach()
                             sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
 
-                            if self.global_step > -1:   # delay for very large scene
+                            if self.global_step > self.cfg.loss_sdf_normal_start:   # delay for very large scene
                                 gaussian_center_normals = sugar_normals.detach()
-                                query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  #NOTE: update sdf normal
+                                query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  # NOTE: update sdf normal
                             else:
                                 query_normal_loss = 0.
 
                             normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
-
                             loss_sdf = loss_sdf + normal_loss
+
+                            self.log('train/sugar_normal_loss', 0.1 * sugar_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
+                            self.log('train/query_normal_loss', 0.01 * query_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
         train_sds_loss = False
         # start computing sds loss
@@ -909,6 +926,22 @@ def zero_grad_inst(pc, instance_range):
     pc._scaling.grad[~keep_mask] = 0
     pc._rotation.grad[~keep_mask] = 0
 
+def load_neus_and_save_mesh(sugar_ckpt_path, obj_name):
+    from ..utils.extract_mesh import marching_cubes_sdf_part
+    neus = Runner(sugar_ckpt_path, None, part_num=1)
+    neus.load_checkpoint(sugar_ckpt_path, '.pth')
+    neus.reset_datasets(sugar_ckpt_path, None, obj_name, iteration=15000, scene_name='threestudio')
+
+    evaluated_mesh = marching_cubes_sdf_part(
+        neus,
+        iteration=0,
+        checkpoint_path=sugar_ckpt_path,
+        resolution=600,
+        vertex_color=False,
+        part=1, thres=0.002,
+        move_surf=True)
 
 if __name__ == '__main__':
-    debug_class = LayoutCHIGSSystem()
+    obj_name_list = ['clock', 'hourglass']
+    system_path = '/data/code/20022_layout3d/layout3d/threestudio/outputs/best_dreamer/An_antique_clock._A_fleeting_hourglass._A_clock_sits_next_to_an_hourglass@20251014-172202/save'
+    sugar_ckpt_path = os.path.join(system_path, 'sugar')

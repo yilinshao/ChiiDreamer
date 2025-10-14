@@ -2527,7 +2527,7 @@ class SuGaR(nn.Module):
 
     def visual_point_cloud(self, iteration=0, checkpoint_path='.'):
         xyz = self.points.detach().cpu().numpy()
-        output_path = os.path.join(checkpoint_path, 'meshes')
+        output_path = os.path.join(checkpoint_path, 'pointcloud')
         os.makedirs(output_path, exist_ok=True)
         trimesh.Trimesh(xyz).export(os.path.join(output_path, 'points_' + str(iteration) + '.ply'))
         print('Visualize Points OK.')
