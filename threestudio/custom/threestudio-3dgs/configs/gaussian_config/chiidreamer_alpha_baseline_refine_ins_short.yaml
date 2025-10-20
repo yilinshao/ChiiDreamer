@@ -156,7 +156,3 @@ checkpoint:
   save_last: true # save at each validation time
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
-
-#
-#        # syl======= split the input prompt
-#        prompt_list = [p.strip() for p in prompt_str.split(',')]

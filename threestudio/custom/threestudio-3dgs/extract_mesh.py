@@ -1,10 +1,8 @@
-
-from np_utils.train import Runner
+from .utils.np_utils.train import Runner
 import os
 import torch
 import numpy as np
 import trimesh
-from np_utils.extract_mesh_meshudf import get_mesh_udf_fast
 import torch.nn.functional as F
 from tqdm import tqdm
 import argparse
@@ -54,88 +52,7 @@ def clean_mesh(mesh, source_path, gs_output_path, dataset_name='real360'):
     mesh.update_faces(pred_visible_mask)
     return mesh
 
-
-def marching_cubes_udf_part(neus, iteration=0, checkpoint_path='.', resolution=700, vertex_color=False, thres=5.,
-                            part=1, world_space=True, crop_border=True):
-    dataset = getattr(neus, 'dataset' + str(part))
-    sdf_network = getattr(neus, 'sdf_network' + str(part))
-
-    # func = sdf_network.sdf
-    def func(xyz):
-        return torch.abs(sdf_network.sdf(xyz))
-
-    def func_grad(xyz):
-        gradients = sdf_network.gradient(xyz)
-        gradients_mag = torch.linalg.norm(gradients, ord=2, dim=-1, keepdim=True)
-        gradients_norm = gradients / (gradients_mag + 1e-5)  # normalize to unit vector
-        return gradients_norm
-    dataset.object_bbox_min = np.array([-0.6,-0.6,-0.6])
-    dataset.object_bbox_max = np.array([0.6,0.6,0.6])
-    voxel_origin = np.ones(3) * dataset.object_bbox_min.min()
-    cube_size = dataset.object_bbox_max.max() - dataset.object_bbox_min.min()
-    try:
-        pred_v, pred_f, pred_mesh, samples, indices = get_mesh_udf_fast(func, func_grad, samples=None,
-                                                                        indices=None, N_MC=resolution,
-                                                                        gradient=True, eps=0.005,
-                                                                        border_gradients=True,
-                                                                        smooth_borders=True,
-                                                                        dist_threshold_ratio=thres,
-                                                                        voxel_origin=voxel_origin,
-                                                                        cube_size=cube_size)
-    except:
-        pred_v, pred_f, pred_mesh, samples, indices = get_mesh_udf_fast(func, func_grad, samples=None,
-                                                                        indices=None, N_MC=resolution,
-                                                                        gradient=True, eps=0.005,
-                                                                        border_gradients=False,
-                                                                        smooth_borders=False,
-                                                                        dist_threshold_ratio=thres,
-                                                                        voxel_origin=voxel_origin,
-                                                                        cube_size=cube_size)
-
-    vertices, triangles = pred_mesh.vertices, pred_mesh.faces
-
-    if vertex_color:
-        colors = []
-        for pts in torch.tensor(vertices, dtype=torch.float).cuda().split(50000):
-            with torch.enable_grad():
-                normals = sdf_network.gradient(pts).squeeze()
-                normals = F.normalize(normals, p=2, dim=-1)
-            ndc_coords = torch.tensor([[0, 0, -1.0]]).cuda()
-            nerf_cameras = nerfmodel.training_cameras
-            p3d_camera = nerf_cameras.p3d_cameras[3]
-            world_coords = p3d_camera.unproject_points(ndc_coords, world_coordinates=True)
-            camera_center = p3d_camera.get_camera_center()
-            ray_directions = world_coords - camera_center
-            ray_directions = ray_directions / torch.norm(ray_directions, dim=-1, keepdim=True)
-            normals = normals * torch.sign((normals * ray_directions).sum(dim=-1, keepdim=True))
-            normals = torch.clamp((normals + 1) / 2, 0, 1.)
-            colors.append(normals.detach().cpu().numpy() * 255)
-        colors = np.concatenate(colors, 0)
-    else:
-        colors = None
-
-    if world_space:
-        vertices = vertices * dataset.shape_scale.cpu().numpy() + dataset.shape_center.cpu().numpy()
-        if crop_border:
-            vertex_mask = np.all((vertices >= dataset.block_min - dataset.split_size / 40) &
-                                 (vertices <= dataset.block_max + dataset.split_size / 40), axis=1)
-            faces_mask = np.all(vertex_mask[triangles], axis=1)
-            new_faces = triangles[faces_mask]
-            new_indices = np.zeros(len(vertex_mask), dtype=int)
-            new_indices[vertex_mask] = np.arange(np.sum(vertex_mask))
-            triangles = new_indices[new_faces]
-            vertices = vertices[vertex_mask]
-            if vertex_color:
-                colors = colors[vertex_mask]
-
-    debug_path = os.path.join(checkpoint_path, 'meshes')
-    os.makedirs(debug_path, exist_ok=True)
-    mesh = trimesh.Trimesh(vertices, triangles, vertex_colors=colors)
-    mesh.export(os.path.join(debug_path, 'meshudf_{}_{}.ply'.format(iteration, part)))
-    print('UDF Marching Cubes OK.')
-    return mesh
-
-def marching_cubes_sdf_part(neus, iteration=0, checkpoint_path='.', resolution=256, vertex_color=False, thres=0.002, part=1, world_space=True, crop_border=True, move_surf=False):
+def marching_cubes_sdf_part(neus, obj_name, iteration=0, checkpoint_path='.', resolution=256, vertex_color=False, thres=0.002, part=1, world_space=True, crop_border=True, move_surf=False):
     dataset = getattr(neus, 'dataset' + str(part))
     sdf_network = getattr(neus, 'sdf_network' + str(part))
     dataset.object_bbox_min = np.array([-0.6,-0.6,-0.6])
@@ -164,10 +81,11 @@ def marching_cubes_sdf_part(neus, iteration=0, checkpoint_path='.', resolution=2
     b_max_np = bound_max.cpu().numpy()
     b_min_np = bound_min.cpu().numpy()
 
+    # vertices 的索引空间是u的形状大小(256x256x256), 所以要进行缩放
     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
     if vertex_color:
         colors = []
-        for pts in torch.tensor(vertices,dtype=torch.float).cuda().split(50000):
+        for pts in torch.tensor(vertices, dtype=torch.float).cuda().split(50000):
             with torch.enable_grad():
                 normals = sdf_network.gradient(pts).squeeze()
                 normals = F.normalize(normals, p=2, dim=-1)
@@ -210,14 +128,15 @@ def marching_cubes_sdf_part(neus, iteration=0, checkpoint_path='.', resolution=2
         for pts in torch.from_numpy(np.array(vertices,dtype=np.float32)).split(200000):
             pts = pts.cuda()
             pts = (pts - dataset.shape_center) / dataset.shape_scale
-            grad = sdf_network.gradient(pts).detach()
+            with torch.enable_grad():
+                grad = sdf_network.gradient(pts).detach()
             grad_norm = F.normalize(grad, p=2, dim=-1).squeeze(1)
             pts = pts - 0.002 * grad_norm
             moved_pts.append(pts.detach())
         moved_pts = torch.cat(moved_pts, 0)
         moved_pts = moved_pts * dataset.shape_scale + dataset.shape_center
         moved_mesh = trimesh.Trimesh(moved_pts.cpu().numpy(), triangles)
-        moved_mesh.export(os.path.join(sugar_checkpoint_path, 'meshes', 'mcubes_moved_{}_{}.ply'.format(iteration, part)))
+        moved_mesh.export(os.path.join(checkpoint_path, 'meshes', 'mcubes_moved_{}_{}.ply'.format(iteration, part)))
 
         mesh = moved_mesh
 
@@ -225,7 +144,32 @@ def marching_cubes_sdf_part(neus, iteration=0, checkpoint_path='.', resolution=2
     return mesh
 
 if __name__ == '__main__':
-    path = "/home/user/project/data"
+    obj_name_list = ['clock', 'hourglass']
+    # Chiidreamer 保存的路径, 包括xyz和neus
+    system_ckpt_path = '/data/code/20022_layout3d/layout3d/threestudio/outputs/best_dreamer/An_antique_clock._A_fleeting_hourglass._A_clock_sits_next_to_an_hourglass@20251015-142758/ckpts/last.ckpt'
+    system_state_dict = torch.load(system_ckpt_path)['state_dict']
+
+    system_path = '/data/code/20022_layout3d/layout3d/threestudio/outputs/best_dreamer/An_antique_clock._A_fleeting_hourglass._A_clock_sits_next_to_an_hourglass@20251014-172202/save'
+    sugar_ckpt_path = os.path.join(system_path, 'sugar')
+    for i, obj_name in enumerate(obj_name_list):
+        sdf_state_dict = {}
+        for name, state in system_state_dict.items():
+            if name.startswith(f'sugar.neus_{i}'):
+                sdf_param_name = name.split(f'sugar.neus_{i}.')[-1]  # 'sdf_network1.lin0'
+                sdf_state_dict[sdf_param_name] = state
+
+        neus = Runner(sugar_ckpt_path, None, part_num=1)
+        neus.load_from_state_dict(sdf_state_dict)
+        neus.reset_datasets(sugar_ckpt_path, None, obj_name, iteration=19500, scene_name='threestudio')
+
+        evaluated_mesh = marching_cubes_sdf_part(
+            neus,
+            iteration=0,
+            checkpoint_path=sugar_ckpt_path,
+            resolution=600,
+            vertex_color=False,
+            part=1, thres=0.002,
+            move_surf=True)
 
 # if __name__ == '__main__':
 #     parser = argparse.ArgumentParser(description='Script to extract and clean mesh.')

@@ -87,7 +87,6 @@ class SuGaROptimizer:
             sdf_network = getattr(model.neus_1, 'sdf_network'+str(i))
             l = l + [{'params': list(sdf_network.parameters()), 'lr': 1e-4, "name": "neus1_sdfnetwork"+str(i)}]
 
-
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.position_sheduler_func = get_expon_lr_func(

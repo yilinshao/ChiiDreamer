@@ -45,6 +45,7 @@ class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
         self._resumed: bool = resumed
         self._resumed_eval: bool = False
         self._resumed_eval_status: dict = {"global_step": 0, "current_epoch": 0}
+        self._resume_path = None
         if "loggers" in cfg:
             self.create_loggers(cfg.loggers)
 
@@ -66,6 +67,9 @@ class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
         self._resumed_eval = True
         self._resumed_eval_status["current_epoch"] = current_epoch
         self._resumed_eval_status["global_step"] = global_step
+
+    def record_resume_path(self, ckpt_path):
+        self._resume_path = ckpt_path
 
     @property
     def resumed(self):

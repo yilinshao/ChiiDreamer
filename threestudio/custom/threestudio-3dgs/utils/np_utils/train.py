@@ -16,12 +16,14 @@ from pytorch3d.ops import knn_points
 from scipy.spatial import cKDTree
 import mcubes
 import warnings
+import torch.nn as nn
 
 warnings.filterwarnings('ignore')
 
 
-class Runner:
-    def __init__(self, path, pointcloud=None, part_num=4, iteration=9000):
+class Runner(nn.Module):
+    def __init__(self, path, pointcloud=None, part_num=4, iteration=9000, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.device = torch.device('cuda')
         self.part_num = part_num
         if pointcloud is not None:
@@ -51,7 +53,7 @@ class Runner:
                 if not isinstance(pointcloud, np.ndarray):
                     pointcloud = pointcloud.clone().detach().cpu().numpy()
                 if hasattr(self, 'dataset' + str(i)):
-                    old_datset = self.__getattribute__('dataset' + str(i))
+                    old_datset = getattr(self, 'dataset' + str(i))
                     pc_bbx = old_datset.pc_bbx
                     shape_center = old_datset.shape_center
                     shape_scale = old_datset.shape_scale
@@ -80,11 +82,21 @@ class Runner:
             sdf_network = self.__getattribute__('sdf_network'+str(i))
             sdf_network.load_state_dict(checkpoint['sdf_network'+str(i)])
 
+    def load_from_state_dict(self, state_dict):
+        for i in range(1, self.part_num + 1):
+            sdf_network_i_state = {}
+            for name, param in state_dict.items():
+                if f'sdf_network{i}' in name:
+                    param_name = name.split(f'sdf_network{i}.')[-1]
+                    sdf_network_i_state[param_name] = param
+            sdf_network = getattr(self, 'sdf_network' + str(i))
+            sdf_network.load_state_dict(sdf_network_i_state)
+
     def save_checkpoint(self, path, iter_step):
         checkpoint = {}
         for i in range(1, self.part_num+1):
             sdf_network = self.__getattribute__('sdf_network'+str(i))
-            checkpoint.update({'sdf_network'+str(i): sdf_network.state_dict()})
+            checkpoint.update({f'sdf_network{i}': sdf_network.state_dict()})
 
         os.makedirs(os.path.join(path, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(path, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(iter_step)))

@@ -239,9 +239,11 @@ def main(args, extras) -> None:
             return
         ckpt = torch.load(ckpt_path, map_location="cpu")
         system.set_resume_status(ckpt["epoch"], ckpt["global_step"])
+        system.record_resume_path(ckpt_path)
 
     show_loaded_gaussians = False
     if args.train:
+        set_system_status(system, cfg.resume)
         if show_loaded_gaussians:
             print("Show loaded gaussians")
             trainer.test(system, dm)

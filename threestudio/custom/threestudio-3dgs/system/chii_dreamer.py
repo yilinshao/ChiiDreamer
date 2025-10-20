@@ -1,21 +1,14 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
-import random
 import threestudio
 import torch
-import pytorch_lightning
 from threestudio.systems.base import BaseLift3DSystem
-from threestudio.systems.utils import parse_optimizer, parse_scheduler
+from threestudio.systems.utils import parse_optimizer
 from threestudio.utils.loss import tv_loss
 from threestudio.utils.typing import *
-from kiui.lpips import LPIPS
-from transformers import AutoImageProcessor, AutoModel, AutoConfig, Dinov2Model
-from PIL import Image
 import math
-import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.transforms import ToPILImage
 from threestudio.utils.ops import (
     get_mvp_matrix,
     get_projection_matrix,
@@ -33,7 +26,6 @@ from ..sugar_scene.sugar_model import SuGaR
 from ..sugar_scene.gs_model import PseudoGaussianSplattingWrapper
 from ..sugar_scene.sugar_optimizer import OptimizationParams, SuGaROptimizer
 from ..sugar_scene.sugar_densifier import SuGaRDensifier
-from ..utils.sugar_utils.loss_utils import l1_loss, ssim
 
 # from ..geometry.gaussian_base import BasicPointCloud
 
@@ -231,6 +223,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         self.start_sdf_regularization_from = self.cfg.start_sdf_regularization_from
 
         torch.set_rng_state(rng_state)
+
 
     def calculate_collision(self, pc1, pc2):
         """
@@ -843,6 +836,37 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         pass
 
     def test_step(self, batch, batch_idx):
+        from ..extract_mesh import marching_cubes_sdf_part
+        # save ply and mesh at the first step of test
+        if batch["index"][0] == 0:
+            iteration_for_sdf_dataset = (self.true_global_step // self.cfg.reset_dataset_every) * self.cfg.reset_dataset_every
+            assert iteration_for_sdf_dataset != 0
+            # 1. save ply
+            save_path = self.get_save_path('point_cloud.ply')
+            self.sugar.save_ply(checkpoint_path=os.path.dirname(save_path), iteration=self.true_global_step)
+
+            # 2. save mesh by sdf network
+            sugar_checkpoint_path = os.path.join(os.path.dirname(self.get_save_dir()), 'sugar')
+            for i in range(2):
+                neus_i = getattr(self.sugar, f'neus_{i}')
+                if i == 0:
+                    obj_i_points = self.sugar.points[0: self.get_accum[0]].detach().cpu().numpy()
+                else:
+                    obj_i_points = self.sugar.points[self.get_accum[0]: self.get_accum[1]].detach().cpu().numpy()
+
+                neus_i.reset_datasets(
+                    sugar_checkpoint_path, obj_i_points, self.obj_name_list[i], iteration_for_sdf_dataset,
+                    scene_name='threestudio', save_dataset=False)
+
+                evaluated_mesh = marching_cubes_sdf_part(
+                    neus_i, obj_name=self.obj_name_list[i],
+                    iteration=self.true_global_step,
+                    checkpoint_path=os.path.dirname(save_path),
+                    resolution=256,
+                    vertex_color=False,
+                    part=1, thres=0.002,
+                    move_surf=False)
+
         out = self(batch)
         self.save_image_grid(
             f"it{self.true_global_step}-test/{batch['index'][0]}.png",
@@ -878,9 +902,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             name="test_step",
             step=self.true_global_step,
         )
-        if batch["index"][0] == 0:
-            save_path = self.get_save_path('point_cloud.ply')
-            self.sugar.save_ply(checkpoint_path=os.path.dirname(save_path), iteration=self.true_global_step)
+
 
     def on_test_epoch_end(self):
         self.save_img_sequence(
@@ -908,6 +930,10 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # self.material.load_state_dict(ckpt_dict["state_dict"][""])
         self.load_state_dict(ckpt_dict["state_dict"])
 
+    @property
+    def get_accum(self):
+        mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
+        return mark_accum
 
 def zero_grad_inst(pc, instance_range):
     # note: 经过prune和densify之后,因为替换了optimizer中的 parameter, 梯度也会清零
@@ -926,20 +952,6 @@ def zero_grad_inst(pc, instance_range):
     pc._scaling.grad[~keep_mask] = 0
     pc._rotation.grad[~keep_mask] = 0
 
-def load_neus_and_save_mesh(sugar_ckpt_path, obj_name):
-    from ..utils.extract_mesh import marching_cubes_sdf_part
-    neus = Runner(sugar_ckpt_path, None, part_num=1)
-    neus.load_checkpoint(sugar_ckpt_path, '.pth')
-    neus.reset_datasets(sugar_ckpt_path, None, obj_name, iteration=15000, scene_name='threestudio')
-
-    evaluated_mesh = marching_cubes_sdf_part(
-        neus,
-        iteration=0,
-        checkpoint_path=sugar_ckpt_path,
-        resolution=600,
-        vertex_color=False,
-        part=1, thres=0.002,
-        move_surf=True)
 
 if __name__ == '__main__':
     obj_name_list = ['clock', 'hourglass']
