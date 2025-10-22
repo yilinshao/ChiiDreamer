@@ -120,7 +120,7 @@ def marching_cubes_sdf_part(neus, obj_name, iteration=0, checkpoint_path='.', re
     debug_path = os.path.join(checkpoint_path, 'meshes')
     os.makedirs(debug_path, exist_ok=True)
     mesh = trimesh.Trimesh(vertices, triangles, vertex_colors=colors)
-    mesh.export(os.path.join(debug_path, 'mcubes_{}_{}.ply'.format(iteration, part)))
+    mesh.export(os.path.join(debug_path, 'mcubes_{}_{}_{}.ply'.format(iteration, obj_name, part)))
 
     # shrink sdf faces
     if move_surf:

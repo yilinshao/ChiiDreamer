@@ -474,7 +474,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
         # reset dataset every 500 iter
         if self.global_step % self.cfg.reset_dataset_every == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
-            print('Recalculating Sample Points...')
+            print('\nRecalculating Sample Points...')
             obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
             self.sugar.neus_0.reset_datasets(
                 sugar_checkpoint_path,
@@ -566,7 +566,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                         _grad_norm = F.normalize(_gradients_sample, dim=1)  #
                         rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
                         sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
-                        sugar_points_diff = torch.norm(self.sugar.points[batch_selected_idx] - sugar_points_moved.detach(), p=2,
+                        sugar_points_diff = torch.norm(self.sugar.points[obj_mask[i]][batch_selected_idx] - sugar_points_moved.detach(), p=2,
                                                        dim=-1).mean()
                         loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
                         self.log('train/points_diff', 0.05 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
@@ -576,7 +576,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                     if train_normal:
                         assert train_sdf, 'require train_sdf=True for train_normal!'
                         if self.global_step > self.cfg.loss_point_normal_start:   # delay for very large scene
-                            sugar_normals = self.sugar.get_normals()[batch_selected_idx]
+                            sugar_normals = self.sugar.get_normals()[obj_mask[i]][batch_selected_idx]
                             surf_normals = _grad_norm.detach()
                             sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
 

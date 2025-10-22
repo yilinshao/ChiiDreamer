@@ -117,6 +117,27 @@ class CustomProgressBar(TQDMProgressBar):
         items.pop("v_num", None)
         return items
 
+    def init_train_tqdm(self):
+        # Customize the training progress bar
+        bar = super().init_train_tqdm()
+        bar.dynamic_ncols = False
+        bar.ncols = 200  # Set the width of the progress bar (in characters)
+        return bar
+
+    def init_test_tqdm(self):
+        # Customize the training progress bar
+        bar = super().init_test_tqdm()
+        bar.dynamic_ncols = False
+        bar.ncols = 200  # Set the width of the progress bar (in characters)
+        return bar
+
+    def init_validation_tqdm(self):
+        # Customize the training progress bar
+        bar = super().init_validation_tqdm()
+        bar.dynamic_ncols = False
+        bar.ncols = 200  # Set the width of the progress bar (in characters)
+        return bar
+
 
 class ProgressCallback(Callback):
     def __init__(self, save_path):
