@@ -25,10 +25,17 @@ system_type: "gaussian-splatting-chiidreamer-system"
 system:
   start_sdf_regularization_from: 0
   start_reset_neighbors_from: 0
-  loss_point_diff_start: 15000
-  loss_point_normal_start: 15000
   loss_sdf_normal_start: 18000
-  reset_dataset_every: 1000
+  reset_dataset_every: 500
+
+  total_iter: 18000  # NOTE: 18000 is divisible by 3000
+  period_iter: 3000
+  sdf_start: 0
+  gs_pull_start: 1500 # reset dataset after gs-pull
+  normal_start: 2000
+  sdf_end: 2500
+  sds_start: 2500  # 2000~3000 sds loss
+
   geometry_type: "gaussian-splatting"
   geometry:
     position_lr: 0.0 # 0.00005 # [0, 0.0005, 0.0001, 500]
@@ -139,13 +146,12 @@ system:
       lr: 0.01
       betas: [0.9, 0.99]
       eps: 1.e-8
-# do not update background
-#    params:
-#      background:
-#        lr: 0.001
+    params:
+      background:
+        lr: 0.001
 
 trainer:
-  max_steps: 20000
+  max_steps: ${system.total_iter}
   log_every_n_steps: 20
   num_sanity_val_steps: 0
   val_check_interval: 200

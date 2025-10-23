@@ -54,10 +54,15 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         reset_neighbors_every: int = 1000
         reset_dataset_every: int = 1000
         start_reset_neighbors_from: int = 7000
-        loss_point_diff_start: int = 1000
-        loss_point_normal_start: int = 1000
         loss_sdf_normal_start: int = 1000
 
+        total_iter: int = 18000
+        period_iter: int = 3000
+        sdf_start: int = 1200
+        gs_pull_start: int = 1500
+        normal_start: int = 1700
+        sdf_end: int = 2000
+        sds_start: int = 2000
 
     cfg: Config
 
@@ -342,64 +347,69 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         }
 
     def configure_optimizers(self):
-        optim = self.sugar_optimizer.get_optimizer
-        self.merged_optimizer = True
-        # optim = self.geometry.optimizer
+        sugar_optim = self.sugar_optimizer.get_optimizer
+        geometry_optim = self.geometry.optimizer
         if hasattr(self, "merged_optimizer"):
-            return [optim]
-        if hasattr(self.cfg.optimizer, "name"):
-            # if certain param (except the 3DGS) are required to optimize, then put them in the net optim, then merge
-            net_optim = parse_optimizer(self.cfg.optimizer, self)
-            optim = self.geometry.merge_optimizer(net_optim)
-            self.merged_optimizer = True
+            return [sugar_optim, geometry_optim]
         else:
-            self.merged_optimizer = False
-        return [optim]
+            if hasattr(self.cfg.optimizer, "name"):
+                # if certain param (except the 3DGS) are required to optimize, then put them in the net optim, then merge
+                net_optim = parse_optimizer(self.cfg.optimizer, self)
+                geometry_optim = self.geometry.merge_optimizer(net_optim)
+                self.merged_optimizer = True
+            else:
+                self.merged_optimizer = False
+            return [sugar_optim, geometry_optim]
 
     def on_train_batch_start(self, batch, batch_idx):
         # Update learning rates
         udfnet_lr = self.sugar.neus_0.get_learning_rate_at_iteration(self.global_step, max_iter=20000)
         self.sugar_optimizer.update_learning_rate(self.global_step, sdfnet_lr=udfnet_lr)
 
-    def forward(self, batch: Dict[str, Any], instance_id=-1) -> Dict[str, Any]:
+    def forward(self, batch: Dict[str, Any], instance_id=-1, val_global_step=None) -> Dict[str, Any]:
+        if val_global_step is None:
+            global_step = self.global_step
+        else:
+            global_step = val_global_step
+        if global_step == 0 or (global_step % self.cfg.period_iter) in range(self.cfg.sdf_start, self.cfg.sdf_end):
+            # rasterizer setting
+            current_sh_levels = sh_levels = 4
+            compute_color_in_rasterizer = False
+            use_same_scale_in_all_directions = False  # Should be False
 
-        # rasterizer setting
-        current_sh_levels = sh_levels = 4
-        compute_color_in_rasterizer = False
-        use_same_scale_in_all_directions = False  # Should be False
+            enforce_entropy_regularization = True
+            white_bg = True
 
-        enforce_entropy_regularization = True
-        white_bg = True
+            # render the image
+            # TODO: delete useless param in rasterizer
+            outputs = self.sugar.render_image_gaussian_rasterizer(
+                batch,
+                verbose=False,
+                comp_rgb_bg=self.background,
+                material=self.material,
+                bg_color=torch.Tensor([1.0, 1.0, 1.0]).to(self.sugar.device) if white_bg else None,
+                sh_deg=current_sh_levels - 1,
+                sh_rotations=None,
+                compute_color_in_rasterizer=compute_color_in_rasterizer,
+                compute_covariance_in_rasterizer=True,
+                return_2d_radii=True,
+                quaternions=None,
+                use_same_scale_in_all_directions=use_same_scale_in_all_directions,
+                return_opacities=enforce_entropy_regularization,
+                use_pulled=False,
+            )
+            return outputs
+        else:
+            self.geometry.update_learning_rate(self.global_step)
+            outputs = self.renderer.batch_forward(batch, instance_id)
+            return outputs
 
-        # render the image
-        # TODO: delete useless param in rasterizer
-        outputs = self.sugar.render_image_gaussian_rasterizer(
-            batch,
-            verbose=False,
-            comp_rgb_bg=self.background,
-            material=self.material,
-            bg_color=torch.Tensor([1.0, 1.0, 1.0]).to(self.sugar.device) if white_bg else None,
-            sh_deg=current_sh_levels - 1,
-            sh_rotations=None,
-            compute_color_in_rasterizer=compute_color_in_rasterizer,
-            compute_covariance_in_rasterizer=True,
-            return_2d_radii=True,
-            quaternions=None,
-            use_same_scale_in_all_directions=use_same_scale_in_all_directions,
-            return_opacities=enforce_entropy_regularization,
-            use_pulled=False,
-        )
-
-        # self.geometry.update_learning_rate(self.global_step)
-        # outputs = self.renderer.batch_forward(batch, instance_id)
-        return outputs
 
     def training_step(self, batch, batch_idx):
-
         # ssyl===============select the gaussians for each instance=====>
         if len(self.prompt_utils_list) > 0:
             rand_num = np.random.rand()
-            rand_num = 0.7
+            # rand_num = 0.7
             if rand_num < 0.33:
                 instance_id = 0
                 self.geometry.selected_instance_id = 0
@@ -418,7 +428,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # syl ==========================在只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
         if instance_id != -1:
             rand_num = np.random.rand()
-            rand_num = 0.1
+            # rand_num = 0.1
             if rand_num > 0.8:
                 render_instance_id = -1
             else:
@@ -427,8 +437,19 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             render_instance_id = instance_id
         # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
 
-        # step: sdf loss
+
         loss_sdf = 0.0
+        loss_sds = 0.0
+        loss_gs = 0.0
+        # step: scaling loss
+        # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
+        clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-7)
+        scaling_loss = torch.abs(clamped_scaling - 1e-7).mean()
+
+        self.log('train/scaling_loss', 100 * scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        # step: sdf loss
+
         # if iteration > 7000
         prune_hard_opacity_threshold = -0.1
         sugar_checkpoint_path = os.path.join(os.path.dirname(self.get_save_dir()), 'sugar')
@@ -443,7 +464,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         obj_mask.append(obj_2_mask.to(torch.bool))
 
         # step: setup dataset, prune the gaussian before sdf loss
-        if self.global_step == 0:
+        if self.global_step % self.cfg.period_iter == 0:
             # TODO: not pruned
             print("Prunning Pointcloud Using Opacity...")
             prune_mask = (self.gaussian_densifier.model.strengths < prune_hard_opacity_threshold).squeeze()
@@ -452,157 +473,160 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
             self.sugar.visual_point_cloud(iteration=0, checkpoint_path=sugar_checkpoint_path)
 
-            loaded_gs_workdir = os.path.normpath(os.path.join(self.cfg.gaussian_checkpoint, '..', '..'))
-            print(f"The initial SDF Datasets are stored in: {loaded_gs_workdir}")
-
             # setup dataset
+            loaded_gs_workdir = os.path.normpath(os.path.join(self.cfg.gaussian_checkpoint, '..', '..'))
+            print(f"The initial SDF Datasets are stored in the loading folder: {loaded_gs_workdir}, "
+                  f"\n not the working dir: {self.get_save_dir()}")
+
+            save_dataset = True if self.global_step == 0 else False
             obj_0_points = self.sugar.points[0: mark_accum[0]].detach().cpu().numpy()
             self.sugar.neus_0.reset_datasets(
                 os.path.join(loaded_gs_workdir, 'sugar'),
                 obj_0_points,
-                self.obj_name_list[0],
-                iteration=self.global_step,
-                scene_name='threestudio')
+                self.obj_name_list[0], iteration=self.global_step, scene_name='threestudio', save_dataset=save_dataset)
 
             obj_1_points = self.sugar.points[mark_accum[0]: mark_accum[1]].detach().cpu().numpy()
             self.sugar.neus_1.reset_datasets(
                 os.path.join(loaded_gs_workdir, 'sugar'),
                 obj_1_points,
-                self.obj_name_list[1],
-                iteration=self.global_step,
-                scene_name='threestudio')
+                self.obj_name_list[1], iteration=self.global_step, scene_name='threestudio', save_dataset=save_dataset)
 
-        # reset dataset every 500 iter
-        if self.global_step % self.cfg.reset_dataset_every == 0 and self.global_step != self.last_resample_iteration and self.global_step > 300:
-            print('\nRecalculating Sample Points...')
-            obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
-            self.sugar.neus_0.reset_datasets(
-                sugar_checkpoint_path,
-                obj_0_points,
-                self.obj_name_list[0],
-                iteration=self.global_step,
-                scene_name='threestudio')
-
-            obj_1_points = self.sugar.points[obj_mask[1]].detach().cpu().numpy()
-            self.sugar.neus_1.reset_datasets(
-                sugar_checkpoint_path,
-                obj_1_points,
-                self.obj_name_list[1],
-                iteration=self.global_step,
-                scene_name='threestudio')
-            self.last_resample_iteration = self.global_step
 
         # step: start sdf regularization
-        if self.global_step >= self.start_sdf_regularization_from:
-            # reset neighbors at start and at every interval
-            if ((self.global_step >= self.cfg.start_reset_neighbors_from) and
-                ((self.global_step == self.start_sdf_regularization_from + 1) or
-                 (self.global_step % self.cfg.reset_neighbors_every == 0)) and self.global_step != self.last_reset_iteration):
-                print("\n---INFO---\nResetting neighbors...")
-                self.sugar.reset_neighbors()
-                self.last_reset_iteration = self.global_step
-            # scaling loss
-            train_scaling = True  # fixme: fixed condition
-            if train_scaling:
-                # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
-                clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-7)
-                scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
-                loss_sdf = loss_sdf + 100 * scaling_loss
-                self.log('train/scaling_loss', 100 * scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
+        if self.global_step % self.cfg.period_iter in range(self.cfg.sdf_start, self.cfg.sdf_end):
+            opt = self.optimizers()[0]
+            loss_sdf = loss_sdf + scaling_loss
+            # # reset neighbors at start and at every interval
+            # if ((self.global_step >= self.cfg.start_reset_neighbors_from) and
+            #     ((self.global_step == self.start_sdf_regularization_from + 1) or
+            #      (self.global_step % self.cfg.reset_neighbors_every == 0)) and self.global_step != self.last_reset_iteration):
+            #     print("\n---INFO---\nResetting neighbors...")
+            #     self.sugar.reset_neighbors()
+            #     self.last_reset_iteration = self.global_step
 
-            # pulling loss
-            train_sdf = True  # fixme: fixed condition
+            # train sdf
             cur_part_num = 1
-            if train_sdf:
-                for i in range(2):
-                    neus_model = getattr(self.sugar, f'neus_{i}')
-                    dataset = getattr(neus_model, 'dataset' + str(cur_part_num))
-                    points, samples, point_gt, points_idx = dataset.get_train_data(10000)
-                    samples.requires_grad = True
+            for i in range(2):
+                neus_model = getattr(self.sugar, f'neus_{i}')
+                dataset = getattr(neus_model, 'dataset' + str(cur_part_num))
+                points, samples, point_gt, points_idx = dataset.get_train_data(10000)
+                samples.requires_grad = True
 
-                    # sdf loss 1
-                    sdf_network = getattr(neus_model, 'sdf_network' + str(cur_part_num))
-                    gradients_sample = sdf_network.gradient(samples).squeeze()  # 5000x3
-                    udf_sample = sdf_network.sdf(samples)  # 5000x1
-                    grad_norm = F.normalize(gradients_sample, dim=1)  # 5000x3
-                    sample_moved = samples - grad_norm * udf_sample  # 5000x3
-                    # update the sdf network not the gs points
-                    ChamferDis = getattr(neus_model, 'ChamferDisL1')
-                    sdf_loss1 = ChamferDis(points.unsqueeze(0), sample_moved.unsqueeze(0))
+                # sdf loss 1
+                sdf_network = getattr(neus_model, 'sdf_network' + str(cur_part_num))
+                gradients_sample = sdf_network.gradient(samples).squeeze()  # 5000x3
+                udf_sample = sdf_network.sdf(samples)  # 5000x1
+                grad_norm = F.normalize(gradients_sample, dim=1)  # 5000x3
+                sample_moved = samples - grad_norm * udf_sample  # 5000x3
+                # update the sdf network not the gs points
+                ChamferDis = getattr(neus_model, 'ChamferDisL1')
+                sdf_loss1 = ChamferDis(points.unsqueeze(0), sample_moved.unsqueeze(0))
 
-                    # sdf loss 2 = loss pull in the paper
-                    scaled_sample_moved = sample_moved * dataset.shape_scale + dataset.shape_center
-                    knn = knn_points(sample_moved[None], points[None], K=1)
-                    knn_idx = knn.idx[0, :, 0]
-                    # gaussian_inv_scaled_rotation = sugar.get_covariance(
-                    #     return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=-1, enlarge_minaxis=-1)
-                    gaussian_inv_scaled_rotation = self.sugar.get_covariance(
-                        return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=100,
-                        enlarge_minaxis=100)[obj_mask[i]]
-                    sugar_points_idx = torch.arange(obj_mask[i].sum(), device='cuda')[dataset.part_select_idx][dataset.downsample_idx]
-                    batch_selected_idx = sugar_points_idx[points_idx][knn_idx]
-                    closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[batch_selected_idx].detach().clone()
-                    surf_points = points[knn_idx].detach().clone() * dataset.shape_scale + dataset.shape_center
+                # sdf loss 2 = loss pull in the paper
+                scaled_sample_moved = sample_moved * dataset.shape_scale + dataset.shape_center
+                knn = knn_points(sample_moved[None], points[None], K=1)
+                knn_idx = knn.idx[0, :, 0]
+                # gaussian_inv_scaled_rotation = sugar.get_covariance(
+                #     return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=-1, enlarge_minaxis=-1)
+                gaussian_inv_scaled_rotation = self.sugar.get_covariance(
+                    return_full_matrix=True, return_sqrt=True, inverse_scales=True, scaling_factor=100,
+                    enlarge_minaxis=100)[obj_mask[i]]
+                sugar_points_idx = torch.arange(obj_mask[i].sum(), device='cuda')[dataset.part_select_idx][dataset.downsample_idx]
+                batch_selected_idx = sugar_points_idx[points_idx][knn_idx]
+                closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[batch_selected_idx].detach().clone()
+                surf_points = points[knn_idx].detach().clone() * dataset.shape_scale + dataset.shape_center
 
-                    shift = (
-                            scaled_sample_moved - surf_points)  # NOTE: scaled_sample_moved = q, surf_points = /mu_j (no gradient, updating the sdf)
-                    warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
-                    neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
-                    neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
-                    if self.global_step > -1:
-                        sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
+                shift = (
+                        scaled_sample_moved - surf_points)  # NOTE: scaled_sample_moved = q, surf_points = /mu_j (no gradient, updating the sdf)
+                warped_shift = closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ shift[..., None]
+                neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
+                neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
+                sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
+
+
+                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
+                self.log('train/sdf_loss', sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
+                self.log('train/cov_loss', sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
+
+                # ours: pull gs
+                if self.global_step % self.cfg.period_iter >= self.cfg.gs_pull_start:  # delay for very large scene
+
+                    # reset dataset every 500 iter
+                    if self.global_step % self.cfg.reset_dataset_every == 0:
+                        print('\n Recalculating Sample Points...')
+                        obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
+                        self.sugar.neus_0.reset_datasets(
+                            sugar_checkpoint_path,
+                            obj_0_points,
+                            self.obj_name_list[0], iteration=self.global_step, scene_name='threestudio',
+                            save_dataset=False)
+
+                        obj_1_points = self.sugar.points[obj_mask[1]].detach().cpu().numpy()
+                        self.sugar.neus_1.reset_datasets(
+                            sugar_checkpoint_path,
+                            obj_1_points,
+                            self.obj_name_list[1], iteration=self.global_step, scene_name='threestudio',
+                            save_dataset=False)
+                        self.last_resample_iteration = self.global_step
+
+                    rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
+                    _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
+                    _udf_sample = sdf_network.sdf(rescaled_sugar_points)
+                    _grad_norm = F.normalize(_gradients_sample, dim=1)  #
+                    rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
+                    sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
+                    sugar_points_diff = torch.norm(self.sugar.points[obj_mask[i]][batch_selected_idx] - sugar_points_moved.detach(), p=2,
+                                                   dim=-1).mean()
+                    loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
+                    self.log('train/points_diff', 0.05 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
+
+                # norm consistency
+                if self.global_step % self.cfg.period_iter >= self.cfg.normal_start:   # delay for very large scene
+                    sugar_normals = self.sugar.get_normals()[obj_mask[i]][batch_selected_idx]
+                    surf_normals = _grad_norm.detach()
+                    sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
+
+                    if self.global_step > -1:   # TODO
+                        gaussian_center_normals = sugar_normals.detach()
+                        query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  # NOTE: update sdf normal
                     else:
-                        sdf_loss2 = 0.
+                        query_normal_loss = 0.
 
-                    loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
-                    self.log('train/sdf_loss', sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
-                    self.log('train/cov_loss', sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
+                    normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
+                    loss_sdf = loss_sdf + normal_loss
 
-                    # ours: pull gs
-                    if self.global_step > self.cfg.loss_point_diff_start:  # delay for very large scene
-                        rescaled_sugar_points = (surf_points - dataset.shape_center) / dataset.shape_scale
-                        _gradients_sample = sdf_network.gradient(rescaled_sugar_points).squeeze()
-                        _udf_sample = sdf_network.sdf(rescaled_sugar_points)
-                        _grad_norm = F.normalize(_gradients_sample, dim=1)  #
-                        rescaled_sugar_points_moved = rescaled_sugar_points - _grad_norm * _udf_sample
-                        sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
-                        sugar_points_diff = torch.norm(self.sugar.points[obj_mask[i]][batch_selected_idx] - sugar_points_moved.detach(), p=2,
-                                                       dim=-1).mean()
-                        loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
-                        self.log('train/points_diff', 0.05 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
+                    self.log('train/sugar_normal_loss', 0.1 * sugar_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
+                    self.log('train/query_normal_loss', 0.01 * query_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
-                    # norm consistency
-                    train_normal = True  # fixme
-                    if train_normal:
-                        assert train_sdf, 'require train_sdf=True for train_normal!'
-                        if self.global_step > self.cfg.loss_point_normal_start:   # delay for very large scene
-                            sugar_normals = self.sugar.get_normals()[obj_mask[i]][batch_selected_idx]
-                            surf_normals = _grad_norm.detach()
-                            sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
+            loss_sdf.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        else:  # train_sds_loss
+            opt = self.optimizers()[1]
+            loss_sds = loss_sds + scaling_loss
+            if self.global_step % self.cfg.period_iter == self.cfg.sds_start:
+                # from sugar.points to system.xyz
+                with torch.no_grad():
+                    self.geometry._xyz[...] = self.sugar._points.detach()  # NOTE: 这一步不会改变xyz的requires_grad等,只拷贝data
+                    self.geometry._scaling[...] = self.sugar._scales.detach()
+                    self.geometry._rotation[...] = self.sugar._quaternions.detach()
+                    self.geometry._opacity[...] = self.sugar.all_densities.detach()
+                    self.geometry._features_dc[...] = self.sugar._sh_coordinates_dc.detach()
+                    self.geometry._features_rest[...] = self.sugar._sh_coordinates_rest.detach()
 
-                            if self.global_step > self.cfg.loss_sdf_normal_start:   # delay for very large scene
-                                gaussian_center_normals = sugar_normals.detach()
-                                query_normal_loss = torch.abs(torch.sum(grad_norm * gaussian_center_normals, -1).abs() - 1).mean()  # NOTE: update sdf normal
-                            else:
-                                query_normal_loss = 0.
-
-                            normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
-                            loss_sdf = loss_sdf + normal_loss
-
-                            self.log('train/sugar_normal_loss', 0.1 * sugar_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
-                            self.log('train/query_normal_loss', 0.01 * query_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
-
-        train_sds_loss = False
-        # start computing sds loss
-        if train_sds_loss:
-            loss_sds = 0.0
+            if self.global_step % self.cfg.period_iter == self.cfg.period_iter - 1:
+                # from system.xyz to sugar.points
+                with torch.no_grad():
+                    print("Initializing 3D gaussians from pre-trained 3D gaussians...")
+                    self.sugar._points[...] = self.geometry._xyz.detach()
+                    self.sugar._scales[...] = self.geometry._scaling.detach()
+                    self.sugar._quaternions[...] = self.geometry._rotation.detach()
+                    self.sugar.all_densities[...] = self.geometry._opacity.detach()
+                    self.sugar._sh_coordinates_dc[...] = self.geometry._features_dc.detach()
+                    self.sugar._sh_coordinates_rest[...] = self.geometry._features_rest.detach()
 
             out = self(batch, render_instance_id)  # outputs.
-
-            visibility_filter = out["visibility_filter"]
-            radii = out["radii"]
             guidance_inp = out["comp_rgb"]
-            viewspace_point_tensor = out["viewspace_points"]
 
             guidance_out = self.guidance(
                 guidance_inp,
@@ -611,13 +635,54 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 rgb_as_latents=False
             )
 
-            self.log("gauss_num", int(self.sugar.points.shape[0]), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log("gauss_num", int(self.geometry._xyz.shape[0]), on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
             # sds loss
             for name, value in guidance_out.items():
                 self.log(f"train/{name}", value)
                 if name.startswith("loss_"):
                     loss_sds += value * self.C(self.cfg.loss[name.replace("loss_", "lambda_")])
+
+            visibility_filter = out["visibility_filter"]
+            radii = out["radii"]
+            viewspace_point_tensor = out["viewspace_points"]
+
+            #  find instance filter
+            # TODO: this should ALSO work in the train gaussian loss
+            instance_filter = torch.zeros(self.sugar.points.shape[0], device=self.sugar.points.device)
+            mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
+            if instance_id == 0:
+                instance_filter[0: mark_accum[instance_id]] = 1
+            elif instance_id == 1:
+                instance_filter[mark_accum[instance_id - 1]: mark_accum[instance_id]] = 1
+            else:
+                instance_filter[:] = 1
+
+            for i, view_filter in enumerate(visibility_filter):  # MV dream has 4 views (seems they are all the same)
+                visibility_filter[i] = view_filter & (instance_filter != 0)
+
+            loss_sds.backward(retain_graph=True)
+            iteration = self.global_step
+
+            self.geometry.update_states(
+                iteration,
+                visibility_filter,
+                radii,
+                viewspace_point_tensor,
+            )
+
+            # step: 清除其他inst的梯度 TODO: ALSO work in the train gaussian loss
+            if instance_id != -1:
+                mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0).cpu()
+                if instance_id == 0:
+                    instance_range = np.arange(0, mark_accum[instance_id])
+                else:
+                    instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
+                zero_grad_inst(self.geometry, instance_range)
+
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
 
         train_gaussian_loss = False
         # gaussian related losses
@@ -648,7 +713,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 loss_gs += self.C(self.cfg.loss["lambda_scales"]) * scale_sum
 
             if self.cfg.loss["lambda_tv_loss"] > 0.0:
-                assert train_sds_loss
+                # assert train_sds_loss
                 loss_tv = self.C(self.cfg.loss["lambda_tv_loss"]) * tv_loss(
                     out["comp_rgb"].permute(0, 3, 1, 2)
                 )
@@ -685,54 +750,10 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             for name, value in self.cfg.loss.items():
                 self.log(f"train_params/{name}", self.C(value))
 
-        #  find instance filter
-        # # instance_filter = torch.zeros(self.geometry.get_xyz.shape[0], device=self.geometry.get_xyz.device)
-        # instance_filter = torch.zeros(self.sugar.points.shape[0], device=self.sugar.points.device)
-        # mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
-        # if instance_id == 0:
-        #     instance_filter[0: mark_accum[instance_id]] = 1
-        # elif instance_id == 1:
-        #     instance_filter[mark_accum[instance_id - 1]: mark_accum[instance_id]] = 1
-        # else:
-        #     instance_filter[:] = 1
-
-        # for i, view_filter in enumerate(visibility_filter):  # MV dream has 4 views (seems they are all the same)
-        #     visibility_filter[i] = view_filter & (instance_filter != 0)
-
-        # loss_sds.backward(retain_graph=True)
-        iteration = self.global_step
-
-        # self.geometry.update_states(
-        #     iteration,
-        #     visibility_filter,
-        #     radii,
-        #     viewspace_point_tensor,
-        # )
-        if train_sds_loss:
-            loss_sds.backward(retain_graph=True)
-        if train_gaussian_loss > 0:
+        if train_gaussian_loss:
             loss_gs.backward()
 
-        loss_sdf.backward()
-
-        # step: 清除其他inst的梯度
-        # if instance_id != -1:
-        #     mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0).cpu()
-        #     if instance_id == 0:
-        #         instance_range = np.arange(0, mark_accum[instance_id])
-        #     else:
-        #         instance_range = np.arange(mark_accum[instance_id - 1], mark_accum[instance_id])
-        #     zero_grad_inst(self.geometry, instance_range)
-        # opt.step()
-        # opt.zero_grad(set_to_none=True)
-
-        # optimizer 返回是list吗?
-        opt = self.optimizers()
-
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-
-        return {"loss": loss_sdf}
+        return {"loss": loss_sdf + loss_sds}
 
     def validation_step(self, batch, batch_idx):
 
@@ -757,7 +778,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             saving_inst_name = [prompt_str.lower().replace(" ", "_") for prompt_str in prompt_list[: -1]]
 
             for i, inst_name in enumerate(saving_inst_name):
-                out = self(batch, i)
+                out = self(batch, i, self.global_step - 1)
                 self.save_image_grid(
                     f"it{self.global_step}-{inst_name}-{batch['index'][0]}.png",
                     [
