@@ -31,18 +31,18 @@ system:
   total_iter: 18000  # NOTE: 18000 is divisible by 3000
   period_iter: 3000
   sdf_start: 0
-  gs_pull_start: 1500 # reset dataset after gs-pull
-  normal_start: 2000
-  sdf_end: 2500
-  sds_start: 2500  # 2000~3000 sds loss
+  gs_pull_start: 15 # reset dataset after gs-pull
+  normal_start: 17
+  sdf_end: 25
+  sds_start: 25  # 2000~3000 sds loss
 
   geometry_type: "gaussian-splatting"
   geometry:
-    position_lr: 0.0 # 0.00005 # [0, 0.0005, 0.0001, 500]
-    scale_lr: 0.0 # 0.005 #[0, 0.005, 0.001, 800]
-    feature_lr: 0.0 # 0.001 # 0.005
-    opacity_lr: 0.0 # 0.001 # 0.05
-    rotation_lr: 0.0 # 0.001
+    position_lr: 0.000005 # [0, 0.0005, 0.0001, 500]
+    scaling_lr: 0.005 #[0, 0.005, 0.001, 800]
+    feature_lr: 0.0001 # 0.005
+    opacity_lr: 0.001 # 0.05
+    rotation_lr: 0.001
     min_opac_prune: 0.05
 
     prune_interval: 100
@@ -101,7 +101,7 @@ system:
     ckpt_path: null # path to a pre-downloaded checkpoint file (null for loading from URL)
     guidance_scale: 30.0
     min_step_percent: 0.02  # (start_iter, start_val, end_val, end_iter)
-    max_step_percent: [500, 0.98, 0.5, 501]
+    max_step_percent: [0, 0.55, 0.45, 10000] # [500, 0.98, 0.5, 501]
     recon_loss: true
     recon_std_rescale: 0.5
 

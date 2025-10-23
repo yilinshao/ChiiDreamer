@@ -782,7 +782,7 @@ class GaussianBaseModel(BaseGeometry, GaussianIO):
                     "lr": param["lr"],
                 }
             )
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-8)
         return self.optimizer
 
     def update_learning_rate(self, iteration):

@@ -184,7 +184,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         position_lr_init = 0.00016
         position_lr_final = 0.0000016
         position_lr_delay_mult = 0.01
-        position_lr_max_steps = 1600
+        position_lr_max_steps = 10000
         feature_lr = 0.0005
         opacity_lr = 0.05
         scaling_lr = 0.005
@@ -437,16 +437,15 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             render_instance_id = instance_id
         # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
 
-
         loss_sdf = 0.0
         loss_sds = 0.0
         loss_gs = 0.0
         # step: scaling loss
         # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
-        clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-7)
-        scaling_loss = torch.abs(clamped_scaling - 1e-7).mean()
-
-        self.log('train/scaling_loss', 100 * scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
+        clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-4)
+        scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
+        scaling_loss = 100 * scaling_loss
+        self.log('train/scaling_loss', scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
 
         # step: sdf loss
 
@@ -542,11 +541,14 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 neighbor_opacities = (warped_shift[..., 0] * warped_shift[..., 0]).sum(dim=-1).clamp(min=0., max=1e8)
                 neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
                 sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
+                # sdf_loss1 ~= 6e-3, sdf_loss2 ~= 1e-6
+                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 100.0 * sdf_loss2
+                self.log('train/sdf_loss', 1.0 * sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
+                self.log('train/cov_loss', 100.0 * sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
 
-
-                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
-                self.log('train/sdf_loss', sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
-                self.log('train/cov_loss', sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
+                eikonal_loss = ((grad_norm.norm(dim=-1) - 1.0) ** 2).mean()
+                loss_sdf = loss_sdf + eikonal_loss
+                self.log('train/eikonal_loss', eikonal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
                 # ours: pull gs
                 if self.global_step % self.cfg.period_iter >= self.cfg.gs_pull_start:  # delay for very large scene
@@ -577,8 +579,10 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                     sugar_points_moved = rescaled_sugar_points_moved * dataset.shape_scale + dataset.shape_center
                     sugar_points_diff = torch.norm(self.sugar.points[obj_mask[i]][batch_selected_idx] - sugar_points_moved.detach(), p=2,
                                                    dim=-1).mean()
-                    loss_sdf = loss_sdf + 0.05 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
-                    self.log('train/points_diff', 0.05 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
+
+                    # sugar_points_diff ~= 8e-4
+                    loss_sdf = loss_sdf + 10.0 * sugar_points_diff  # NOTE: update the gs, pull them closer to sdf surface
+                    self.log('train/points_diff', 10.0 * sugar_points_diff, on_step=True, on_epoch=True, prog_bar=True)
 
                 # norm consistency
                 if self.global_step % self.cfg.period_iter >= self.cfg.normal_start:   # delay for very large scene
@@ -592,15 +596,58 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                     else:
                         query_normal_loss = 0.
 
+                    # sugar normal loss and query normal loss ~= 0.2
                     normal_loss = 0.1 * sugar_normal_loss + 0.01 * query_normal_loss
                     loss_sdf = loss_sdf + normal_loss
 
                     self.log('train/sugar_normal_loss', 0.1 * sugar_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
                     self.log('train/query_normal_loss', 0.01 * query_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
+                # ours elastic potential energy
+                # with torch.no_grad()?
+                if self.global_step % self.cfg.period_iter >= 20:
+                    # cp=complementary, 循环所有作用在物体 i 上面的力
+                    for cp_i in range(len(obj_mask)):
+                        if cp_i == i:
+                            continue
+                        cp_neus_model = getattr(self.sugar, f'neus_{cp_i}')
+                        cp_dataset = getattr(cp_neus_model, 'dataset' + str(cur_part_num))
+                        cp_sdf_network = getattr(cp_neus_model, 'sdf_network' + str(cur_part_num))
+
+                        my_points = self.sugar.points[obj_mask[i]][sugar_points_idx].detach().cpu().numpy()
+                        cp_selected_bool = np.all((my_points > cp_dataset.block_min) & (my_points < cp_dataset.block_max), axis=1)
+                        cp_selected_idx = sugar_points_idx[cp_selected_bool]
+                        my_points_in_cp_box = my_points[cp_selected_bool]
+
+                        my_points_in_cp_box = my_points_in_cp_box - cp_dataset.shape_center.detach().cpu().numpy()
+                        my_points_in_cp_box = my_points_in_cp_box / cp_dataset.shape_scale.detach().cpu().numpy()
+
+                        my_points_sdf = cp_sdf_network.sdf(torch.from_numpy(my_points_in_cp_box).to(self.device).float())
+                        collision_bool = my_points_sdf.squeeze(1).detach().cpu().numpy() < 0.02
+                        collision_idx = cp_selected_idx[collision_bool]
+                        my_collision_pts = my_points_in_cp_box[collision_bool]
+
+                        print(f'Total number Obj{i} is {self.sugar.points[obj_mask[i]].shape[0]}, \
+                        has {my_collision_pts.shape[0]} collision points.')
+
+                        if self.global_step % 50 == 0:
+                            # save point cloud
+                            import trimesh
+                            xyz_show = my_collision_pts
+                            output_path = os.path.join(self.get_save_dir(), 'pointcloud')
+                            os.makedirs(output_path, exist_ok=True)
+                            trimesh.Trimesh(xyz_show).export(os.path.join(output_path, f'collision_points_of_obj{i}_' + str(self.global_step) + '.ply'))
+                            print('Visualize Points OK.')
+
+                        # calculate the energy
+                        collision_gs_normal = self.sugar.get_normals()[obj_mask[i]][collision_idx]
+                        sum_normal = collision_gs_normal.sum(dim=0)
+
+
+
             loss_sdf.backward()
             opt.step()
-            opt.zero_grad(set_to_none=True)
+
         else:  # train_sds_loss
             opt = self.optimizers()[1]
             loss_sds = loss_sds + scaling_loss
@@ -649,7 +696,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
             #  find instance filter
             # TODO: this should ALSO work in the train gaussian loss
-            instance_filter = torch.zeros(self.sugar.points.shape[0], device=self.sugar.points.device)
+            instance_filter = torch.zeros(self.geometry._xyz.shape[0], device=self.geometry._xyz.device)
             mark_accum = torch.cumsum(self.geometry.mark_instances, dim=0)
             if instance_id == 0:
                 instance_filter[0: mark_accum[instance_id]] = 1
@@ -681,9 +728,8 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 zero_grad_inst(self.geometry, instance_range)
 
             opt.step()
-            opt.zero_grad(set_to_none=True)
 
-
+        opt.zero_grad(set_to_none=True)
         train_gaussian_loss = False
         # gaussian related losses
         if train_gaussian_loss:
@@ -756,21 +802,6 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         return {"loss": loss_sdf + loss_sds}
 
     def validation_step(self, batch, batch_idx):
-
-        # # debbuyg      =============
-        # if len(self.prompt_utils_list) > 0:
-        #     rand_num = np.random.rand()
-        #     rand_num = 0.8
-        #     if rand_num < 0.33:
-        #         instance_id = 0
-        #         self.geometry.selected_instance_id = 0
-        #     elif rand_num < 0.66:
-        #         instance_id = 1
-        #         self.geometry.selected_instance_id = 1
-        #
-        #     else:
-        #         instance_id = -1
-        #         self.geometry.selected_instance_id = -1
 
         save_instances = True
         if save_instances:
