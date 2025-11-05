@@ -1,0 +1,27 @@
+--config
+custom/threestudio-3dgs/configs/gaussian_config/alpha_baseline_refine_ins_short.yaml
+--train
+--gpu
+0
+system.prompt_processor.prompt="An antique clock. A fleeting hourglass. A clock sits next to an hourglass"
+system.geometry.geometry_convert_from="../LGM/3d_instance_storage/hourglass"
+
+
+--config
+custom/threestudio-3dgs/configs/gaussian_config/alpha_baseline_refine_ins_short.yaml
+--train
+--gpu
+0
+system.prompt_processor.prompt="a baby bunny. a stack of pancakes. a baby bunny sitting on top of a stack of pancakes"
+system.geometry.geometry_convert_from="../LGM/3d_instance_storage/bunny"
+
+
+
+
+--config
+custom/threestudio-3dgs/configs/gaussian_config/alpha_baseline_refine_ins_short.yaml
+--train
+--gpu
+0
+system.prompt_processor.prompt="a wooden desk. a luxurious perfume bottle. a dainty jewelry box. a luxurious perfume bottle sits next to a dainty jewelry box on a wooden desk"
+system.geometry.geometry_convert_from="../LGM/3d_instance_storage/bunny"

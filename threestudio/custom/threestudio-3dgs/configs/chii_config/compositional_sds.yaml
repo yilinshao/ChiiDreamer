@@ -1,4 +1,4 @@
-name: "best_dreamer" #
+name: "compositional_gs_training" #
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "outputs"
 seed: 0
@@ -21,36 +21,19 @@ data:
   eval_fovy_deg: 40.
   rays_d_normalize: false
 
-system_type: "gaussian-splatting-chiidreamer-system"
+system_type: "gaussian-splatting-layout-system"
 system:
-  start_sdf_regularization_from: 0
-  start_reset_neighbors_from: 0
-  loss_sdf_normal_start: 18000
-  reset_dataset_every: 500
-
-  total_iter: 18000  # NOTE: 18000 is divisible by 3000
-  period_iter: 3000
-  #------------
-  sdf_start: 0
-  gs_pull_start: 1200 # reset dataset after gs-pull
-  normal_start: 1400
-  #------------
-  collision_start: 1800
-  #------------
-  sdf_end: 2000
-  sds_start: 2200  # 2000~3000 sds loss
-
   geometry_type: "gaussian-splatting"
   geometry:
-    position_lr: [0, 0.0005, 0.0001, 1200] # [0, 0.0005, 0.0001, 500]
-    scaling_lr: [0, 0.0005, 0.0001, 1200] #[0, 0.005, 0.001, 800]
-    feature_lr: 0.0005 # 0.005
-    opacity_lr: 0.005 # 0.05
+    position_lr: 0.00005 # [0, 0.0005, 0.0001, 500]
+    scale_lr: 0.005 #[0, 0.005, 0.001, 800]
+    feature_lr: 0.001 # 0.005
+    opacity_lr: 0.001 # 0.05
     rotation_lr: 0.001
     min_opac_prune: 0.05
 
-    prune_interval: 100
-    prune_from_iter: 200
+    prune_interval: 1
+    prune_from_iter: 0
     prune_until_iter: 900
 
     densification_interval: 100
@@ -71,6 +54,7 @@ system:
     optimize_gaussians: true
     init_from_depth: true
     layout_2d: [[0.125, 0.5, 0.5, 0.875], [0.375, 0.125, 0.875, 0.875]]
+#    layout_2d: [[0.3, 0.125, 0.7, 0.5], [0.2, 0.5, 0.8, 0.75]]
     layout_depth_lr: 0.001
     layout_quat_lr: 0.01
 
@@ -105,7 +89,7 @@ system:
     ckpt_path: null # path to a pre-downloaded checkpoint file (null for loading from URL)
     guidance_scale: 30.0
     min_step_percent: 0.02  # (start_iter, start_val, end_val, end_iter)
-    max_step_percent: [0, 0.8, 0.4, 500] # [500, 0.98, 0.5, 501]
+    max_step_percent: [500, 0.98, 0.5, 501]
     recon_loss: true
     recon_std_rescale: 0.5
 
@@ -134,13 +118,13 @@ system:
 
   loss:
     lambda_sds: 1.0
-    lambda_position: 0.0 # 0.0
-    lambda_opacity: 0.0 # 0.1
+    lambda_position: 0.0 # 1.0
+    lambda_opacity: 0.1 # 0.1
     lambda_sparsity: 0.0
-    lambda_scales: 0.0 # 0.001
-    lambda_tv_loss: 0.0 # 1.0
-    lambda_depth_tv_loss: 0.0 # 20.0
-    lambda_normal_smooth_loss: 0.0 # 100.0
+    lambda_scales: 0.001 # 0.001
+    lambda_tv_loss: 1.0 # 1.0
+    lambda_depth_tv_loss: 20.0 # 20.0
+    lambda_normal_smooth_loss: 100.0 # 100.0
     lambda_feat_recon_loss: 0.0
     lambda_collision: 0.0
 
@@ -155,10 +139,10 @@ system:
         lr: 0.001
 
 trainer:
-  max_steps: ${system.total_iter}
-  log_every_n_steps: 20
+  max_steps: 1500
+  log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 200
+  val_check_interval: 100
   enable_progress_bar: true
   precision: 32
 
@@ -166,3 +150,7 @@ checkpoint:
   save_last: true # save at each validation time
   save_top_k: -1
   every_n_train_steps: ${trainer.max_steps}
+
+#
+#        # syl======= split the input prompt
+#        prompt_list = [p.strip() for p in prompt_str.split(',')]

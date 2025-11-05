@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 import numpy as np
 import threestudio
+import trimesh
 import torch
 from threestudio.systems.base import BaseLift3DSystem
 from threestudio.systems.utils import parse_optimizer
@@ -61,6 +62,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         sdf_start: int = 1200
         gs_pull_start: int = 1500
         normal_start: int = 1700
+        collision_start: int = 1800
         sdf_end: int = 2000
         sds_start: int = 2000
 
@@ -102,6 +104,8 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         # init chiidreamer, first, load from gaussian checkpoint
         assert self.cfg.gaussian_checkpoint is not None
         self.load_gaussian_checkpoint(self.cfg.gaussian_checkpoint)
+
+        self.no_collision = False
 
         # get random number generation and recover it after initialization, to maintain dataset loading order
         rng_state = torch.get_rng_state()
@@ -349,6 +353,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
     def configure_optimizers(self):
         sugar_optim = self.sugar_optimizer.get_optimizer
         geometry_optim = self.geometry.optimizer
+        dummy_optimizer = torch.optim.Adam([torch.zeros(1, requires_grad=True)], lr=1e-6)
         if hasattr(self, "merged_optimizer"):
             return [sugar_optim, geometry_optim]
         else:
@@ -359,7 +364,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 self.merged_optimizer = True
             else:
                 self.merged_optimizer = False
-            return [sugar_optim, geometry_optim]
+            return [sugar_optim, geometry_optim, dummy_optimizer]
 
     def on_train_batch_start(self, batch, batch_idx):
         # Update learning rates
@@ -437,15 +442,15 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
             render_instance_id = instance_id
         # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
 
-        loss_sdf = 0.0
-        loss_sds = 0.0
-        loss_gs = 0.0
+        loss_sdf = torch.tensor(0.0, device=self.device)
+        loss_sds = torch.tensor(0.0, device=self.device)
+        loss_gs = torch.tensor(0.0, device=self.device)
         # step: scaling loss
         # scaling_loss = torch.abs(sugar.scaling.min(1)[0] - 1e-7).mean()
-        clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-4)
-        scaling_loss = torch.abs(clamped_scaling - 1e-4).mean()
+        clamped_scaling = torch.clamp(self.sugar.scaling.min(1)[0], min=1e-5)
+        scaling_loss = torch.abs(clamped_scaling - 1e-5).mean()
         scaling_loss = 100 * scaling_loss
-        self.log('train/scaling_loss', scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/scaling_loss', 100 * scaling_loss, on_step=True, on_epoch=True, prog_bar=True)
 
         # step: sdf loss
 
@@ -492,7 +497,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
 
         # step: start sdf regularization
-        if self.global_step % self.cfg.period_iter in range(self.cfg.sdf_start, self.cfg.sdf_end):
+        if self.global_step % self.cfg.period_iter in range(self.cfg.sdf_start, self.cfg.collision_start):
             opt = self.optimizers()[0]
             loss_sdf = loss_sdf + scaling_loss
             # # reset neighbors at start and at every interval
@@ -505,6 +510,7 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
 
             # train sdf
             cur_part_num = 1
+            dataset_reseted = False
             for i in range(2):
                 neus_model = getattr(self.sugar, f'neus_{i}')
                 dataset = getattr(neus_model, 'dataset' + str(cur_part_num))
@@ -542,19 +548,20 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 neighbor_opacities = torch.exp(-1. / 2 * neighbor_opacities)
                 sdf_loss2 = torch.abs(1 - neighbor_opacities)[neighbor_opacities > 0.9].mean()  # NOTE: loss pull
                 # sdf_loss1 ~= 6e-3, sdf_loss2 ~= 1e-6
-                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 100.0 * sdf_loss2
+                loss_sdf = loss_sdf + 1.0 * sdf_loss1 + 1.0 * sdf_loss2
                 self.log('train/sdf_loss', 1.0 * sdf_loss1, on_step=True, on_epoch=True, prog_bar=True)
-                self.log('train/cov_loss', 100.0 * sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
+                self.log('train/cov_loss', 1.0 * sdf_loss2, on_step=True, on_epoch=True, prog_bar=True)
 
-                eikonal_loss = ((grad_norm.norm(dim=-1) - 1.0) ** 2).mean()
-                loss_sdf = loss_sdf + eikonal_loss
-                self.log('train/eikonal_loss', eikonal_loss, on_step=True, on_epoch=True, prog_bar=True)
+                eikonal_loss = ((gradients_sample.norm(dim=-1) - 1.0) ** 2).mean()
+                loss_sdf = loss_sdf + 0.005 * eikonal_loss
+                self.log('train/eikonal_loss', 0.05 * eikonal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
                 # ours: pull gs
                 if self.global_step % self.cfg.period_iter >= self.cfg.gs_pull_start:  # delay for very large scene
 
                     # reset dataset every 500 iter
-                    if self.global_step % self.cfg.reset_dataset_every == 0:
+                    if self.global_step % self.cfg.reset_dataset_every == 0 and not dataset_reseted:
+                        dataset_reseted = True
                         print('\n Recalculating Sample Points...')
                         obj_0_points = self.sugar.points[obj_mask[0]].detach().cpu().numpy()
                         self.sugar.neus_0.reset_datasets(
@@ -587,6 +594,8 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 # norm consistency
                 if self.global_step % self.cfg.period_iter >= self.cfg.normal_start:   # delay for very large scene
                     sugar_normals = self.sugar.get_normals()[obj_mask[i]][batch_selected_idx]
+                    mark_reversed_normals = sugar_normals * (self.sugar.points[obj_mask[i]][batch_selected_idx] - dataset.shape_center) < 0
+                    sugar_normals[mark_reversed_normals] = -sugar_normals[mark_reversed_normals]
                     surf_normals = _grad_norm.detach()
                     sugar_normal_loss = torch.abs(torch.sum(surf_normals * sugar_normals, -1).abs() - 1).mean()  # NOTE: update gs normal
 
@@ -603,9 +612,29 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                     self.log('train/sugar_normal_loss', 0.1 * sugar_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
                     self.log('train/query_normal_loss', 0.01 * query_normal_loss, on_step=True, on_epoch=True, prog_bar=True)
 
-                # ours elastic potential energy
-                # with torch.no_grad()?
-                if self.global_step % self.cfg.period_iter >= 20:
+            # 只有在没有collision的时候才计算sdf的backward
+            loss_sdf.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+        # ours elastic potential energy
+        elif self.global_step % self.cfg.period_iter in range(self.cfg.collision_start, self.cfg.sds_start):
+            opt = self.optimizers()[-1]
+            if self.global_step % self.cfg.period_iter == self.cfg.collision_start:
+                self.total_move_vector = torch.zeros(3, device=self.device)
+            with torch.no_grad():
+                cur_part_num = 1
+                for i in range(2):
+                    if i == 1: # i = 1 is the mounting object
+                        continue
+                    neus_model = getattr(self.sugar, f'neus_{i}')
+                    dataset = getattr(neus_model, 'dataset' + str(cur_part_num))
+                    sdf_network = getattr(neus_model, 'sdf_network' + str(cur_part_num))
+                    sugar_points_idx = torch.arange(obj_mask[i].sum(), device='cuda')[dataset.part_select_idx][dataset.downsample_idx]
+                    my_points = self.sugar.points[obj_mask[i]][sugar_points_idx]
+                    if torch.isnan(my_points).any():
+                        raise ValueError('Nan in current object points!', )
+
                     # cp=complementary, 循环所有作用在物体 i 上面的力
                     for cp_i in range(len(obj_mask)):
                         if cp_i == i:
@@ -613,42 +642,61 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                         cp_neus_model = getattr(self.sugar, f'neus_{cp_i}')
                         cp_dataset = getattr(cp_neus_model, 'dataset' + str(cur_part_num))
                         cp_sdf_network = getattr(cp_neus_model, 'sdf_network' + str(cur_part_num))
-
-                        my_points = self.sugar.points[obj_mask[i]][sugar_points_idx].detach().cpu().numpy()
-                        cp_selected_bool = np.all((my_points > cp_dataset.block_min) & (my_points < cp_dataset.block_max), axis=1)
+                        cp_selected_bool = ((my_points > torch.from_numpy(cp_dataset.block_min).to(self.device))
+                                            & (my_points < torch.from_numpy(cp_dataset.block_max).to(self.device))).all(dim=1)
                         cp_selected_idx = sugar_points_idx[cp_selected_bool]
                         my_points_in_cp_box = my_points[cp_selected_bool]
 
-                        my_points_in_cp_box = my_points_in_cp_box - cp_dataset.shape_center.detach().cpu().numpy()
-                        my_points_in_cp_box = my_points_in_cp_box / cp_dataset.shape_scale.detach().cpu().numpy()
+                        my_points_in_cp_box = my_points_in_cp_box - cp_dataset.shape_center
+                        my_points_in_cp_box = my_points_in_cp_box / cp_dataset.shape_scale
 
-                        my_points_sdf = cp_sdf_network.sdf(torch.from_numpy(my_points_in_cp_box).to(self.device).float())
+                        my_points_sdf = cp_sdf_network.sdf(my_points_in_cp_box)
                         collision_bool = my_points_sdf.squeeze(1).detach().cpu().numpy() < 0.02
                         collision_idx = cp_selected_idx[collision_bool]
                         my_collision_pts = my_points_in_cp_box[collision_bool]
+                        if my_collision_pts.shape[0] < 100:
+                            print('*'*20, 'no collision points now, great!')
+                            # self.no_collision = True
+                            # break
 
-                        print(f'Total number Obj{i} is {self.sugar.points[obj_mask[i]].shape[0]}, \
-                        has {my_collision_pts.shape[0]} collision points.')
-
+                        # save point cloud
                         if self.global_step % 50 == 0:
-                            # save point cloud
-                            import trimesh
-                            xyz_show = my_collision_pts
+                            print(f'Total number Obj{i} is {self.sugar.points[obj_mask[i]].shape[0]}, \
+                            has {my_collision_pts.shape[0]} collision points.')
+                            xyz_show = my_collision_pts.detach().cpu().numpy()
                             output_path = os.path.join(self.get_save_dir(), 'pointcloud')
                             os.makedirs(output_path, exist_ok=True)
                             trimesh.Trimesh(xyz_show).export(os.path.join(output_path, f'collision_points_of_obj{i}_' + str(self.global_step) + '.ply'))
                             print('Visualize Points OK.')
 
                         # calculate the energy
-                        collision_gs_normal = self.sugar.get_normals()[obj_mask[i]][collision_idx]
-                        sum_normal = collision_gs_normal.sum(dim=0)
+                        # force: from the complementary objects
+                        collision_force = -1.0 * cp_sdf_network.sdf(my_collision_pts)
+                        # dir: grad the current object
+                        my_collision_pts = (my_collision_pts * cp_dataset.shape_scale) + cp_dataset.shape_center
+                        my_collision_pts = (my_collision_pts - dataset.shape_center) / dataset.shape_scale
+                        with torch.enable_grad():
+                            grad_collision_pts = sdf_network.gradient(my_collision_pts).squeeze()
+                        grad_collision_norm = F.normalize(grad_collision_pts, dim=1)
+                        # get vector
+                        grad_collision_dir = - 1.0 * grad_collision_norm
 
+                        force_vector = torch.mean(collision_force * grad_collision_dir, dim=0)
+                        move_vector = force_vector
+                        move_vector[-1] = torch.clamp(move_vector[-1], min=0.0)
+                        # print('='*200, move_vector)
 
-
-            loss_sdf.backward()
-            opt.step()
+                        # update data in sugar
+                        self.sugar.points[obj_mask[i]] = self.sugar.points[obj_mask[i]] + 0.02 * move_vector
+                        self.total_move_vector = self.total_move_vector + move_vector
+                        if self.global_step % self.cfg.period_iter == self.cfg.sds_start - 1:
+                            print(f'Total move vector so far: ', self.total_move_vector)
+                        # update dataset
+                        dataset.shape_center = dataset.shape_center + 0.02 * move_vector
+                opt.step()
 
         else:  # train_sds_loss
+            self.no_collision = False
             opt = self.optimizers()[1]
             loss_sds = loss_sds + scaling_loss
             if self.global_step % self.cfg.period_iter == self.cfg.sds_start:
@@ -728,8 +776,8 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
                 zero_grad_inst(self.geometry, instance_range)
 
             opt.step()
+            opt.zero_grad(set_to_none=True)
 
-        opt.zero_grad(set_to_none=True)
         train_gaussian_loss = False
         # gaussian related losses
         if train_gaussian_loss:
@@ -802,7 +850,6 @@ class LayoutCHIGSSystem(BaseLift3DSystem):
         return {"loss": loss_sdf + loss_sds}
 
     def validation_step(self, batch, batch_idx):
-
         save_instances = True
         if save_instances:
             prompt_list = [prompt_processor.prompt for prompt_processor in self.prompt_processor_list]

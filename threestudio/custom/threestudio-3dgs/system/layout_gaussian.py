@@ -96,6 +96,7 @@ class LayoutGSSystem(BaseLift3DSystem):
             )
             self.prompt_utils = self.prompt_processor()
 
+        self.n_object = len(prompt_utils) - 1
         #  edited by colez
 
         if self.cfg.loss['lambda_feat_recon_loss'] > 0.0 and self.geometry.cfg.optimize_layout:
@@ -265,7 +266,7 @@ class LayoutGSSystem(BaseLift3DSystem):
         # ssyl===============select the gaussians for each instance=====>
         if len(self.prompt_utils_list) > 0:
             rand_num = np.random.rand()
-            rand_num = 0.2
+            # rand_num = 0.2
             if rand_num < 0.33:
                 instance_id = 0
                 self.geometry.selected_instance_id = 0
@@ -286,7 +287,7 @@ class LayoutGSSystem(BaseLift3DSystem):
         # syl ==========================只有instance渲染的过程中,挑一部分全部渲染,增强相互之间的语义
         if instance_id != -1:
             rand_num = np.random.rand()
-            rand_num = 0.1
+            # rand_num = 0.1
             if rand_num > 0.8:
                 render_instance_id = -1
             else:
@@ -412,7 +413,6 @@ class LayoutGSSystem(BaseLift3DSystem):
             self.log(f"train/loss_reference", loss_ref)
             loss_layout += loss_ref
 
-
         # collision loss
         if self.cfg.loss['lambda_collision'] > 0.0 and self.global_step % 5 == 0:
             samples = list(range(self.geometry.num_layouts))
@@ -494,21 +494,6 @@ class LayoutGSSystem(BaseLift3DSystem):
         return {"loss": loss_sds}
 
     def validation_step(self, batch, batch_idx):
-
-        # # debbuyg      =============
-        # if len(self.prompt_utils_list) > 0:
-        #     rand_num = np.random.rand()
-        #     rand_num = 0.8
-        #     if rand_num < 0.33:
-        #         instance_id = 0
-        #         self.geometry.selected_instance_id = 0
-        #     elif rand_num < 0.66:
-        #         instance_id = 1
-        #         self.geometry.selected_instance_id = 1
-        #
-        #     else:
-        #         instance_id = -1
-        #         self.geometry.selected_instance_id = -1
 
         save_instances = True
         if save_instances:

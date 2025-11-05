@@ -1,4 +1,3 @@
-
 import os
 import tyro
 import glob
@@ -252,8 +251,10 @@ if __name__ == '__main__':
     file_paths = sorted([os.path.join(item, 'centralized_tiled.jpg') for item in subfolders])
     device = 'cuda:0'
     is_t2i = False
-    prompt_set = ['An antique clock', 'An hourglass']
+    # prompt_set = ['An antique clock', 'An hourglass']
+    # prompt_set = ['a baby bunny', 'a stack of pancakes']
+    prompt_set = ['a wooden desk', 'a luxurious perfume bottle', 'a dainty jewelry box']
     model, bg_remover, pipe_text, pipe, proj_matrix = initialize_model(opt, device)
-    
+
     for i, path in enumerate(file_paths):
         process(opt, model, prompt_set[i], bg_remover, device, pipe, pipe_text, path, proj_matrix, is_t2i=is_t2i, num=i) # , input_multiview=input_multiview[i]

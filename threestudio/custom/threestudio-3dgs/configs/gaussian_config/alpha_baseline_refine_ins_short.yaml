@@ -54,6 +54,7 @@ system:
     optimize_gaussians: true
     init_from_depth: true
     layout_2d: [[0.125, 0.5, 0.5, 0.875], [0.375, 0.125, 0.875, 0.875]]
+#    layout_2d: [[0.3, 0.125, 0.7, 0.5], [0.2, 0.5, 0.8, 0.75]]
     layout_depth_lr: 0.001
     layout_quat_lr: 0.01
 

@@ -15,10 +15,9 @@ else:
 from .data import random_multiview
 from .background import gaussian_mvdream_background
 from .geometry import exporter, gaussian_base, gaussian_io
-import sys
-print(sys.modules.keys())
+
 from .utils import np_utils
-print(sys.modules.keys())
+
 from .material import gaussian_material
 from .guidance import spatial_guidance, sd_latent
 from .renderer import (

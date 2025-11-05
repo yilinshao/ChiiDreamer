@@ -102,10 +102,24 @@ if __name__ == '__main__':
 
     # ================================================= #
     # --------- edit prompt & instances heree --------- #
-    prompt_final = [['masterpiece, best quality, front view, An antique clock sits next to a fleeting hourglass',
-                     'An antique clock', 'An hourglass']]
-    bboxes = [[[0.125, 0.5, 0.5, 0.875], [0.375, 0.125, 0.875, 0.875]]]
-    asset = 'hourglass'
+    # prompt_final = [['masterpiece, best quality, front view, An antique clock sits next to a fleeting hourglass', 'An antique clock', 'An hourglass']]
+    # bboxes = [[[0.125, 0.5, 0.5, 0.875], [0.375, 0.125, 0.875, 0.875]]]
+    # asset = 'hourglass'
+
+    # prompt_final = [['side view, a DSLR photo of a baby bunny sitting on top of a stack of pancakes', 'a baby bunny', 'a stack of pancakes']]
+    # bboxes = [[[0.3, 0.125, 0.7, 0.5], [0.2, 0.5, 0.8, 0.75]]]
+    # asset = 'bunny'
+
+    # prompt_final = [['masterpiece, best quality, front view, a pair of glasses on an open notebook', 'a pair of glasses', 'an open notebook']]
+    # bboxes = [[[0.25, 0.375, 0.75, 0.625], [0.15, 0.15, 0.85, 0.85]]]
+    # asset = 'glass'
+    prompt_final = [['masterpiece, best quality, no background, a luxurious perfume bottle sits next to a dainty jewelry box on a wooden desk', 'a wooden desk', 'a luxurious perfume bottle', 'a dainty jewelry box']]
+    # bboxes = [[[0.08, 0.41, 0.92, 0.92], [0.3, 0.25, 0.4, 0.6], [0.48, 0.5, 0.63, 0.6]]]
+    bboxes = [[[0.22, 0.41, 0.78, 0.81], [0.33, 0.27, 0.43, 0.54], [0.49, 0.45, 0.63, 0.54]]]
+
+    # bboxes = [[[0.1, 0.4, 0.9, 0.8], [0.4, 0.4, 0.5, 0.55], [0.55, 0.5, 0.7, 0.55]]]
+    asset = 'perfum_desk_big_desk_recoord_0_0_nobg'
+
     # --------- edit prompt & instances here --------- #
     # ================================================= #
     
@@ -114,7 +128,7 @@ if __name__ == '__main__':
     negative_prompt = 'worst quality, low quality, bad anatomy, watermark, text, blurry'
     seed = 0
     seed_everything(seed)
-    image = pipe(prompt_final, bboxes, num_inference_steps=80, guidance_scale=7.5, MIGCsteps=25,
+    image = pipe(prompt_final, bboxes, num_inference_steps=80, guidance_scale=5.0, MIGCsteps=25,
                  aug_phase_with_and=False, NaiveFuserSteps=25, negative_prompt=negative_prompt).images[0]
     image.save(f'./layout2image/{asset}/output.png')
     image = pipe.draw_box_desc(image, bboxes[0], prompt_final[0][1:])
@@ -206,7 +220,7 @@ if __name__ == '__main__':
         inpaint_img = kiui.read_image(os.path.join(work_space, f'{asset}/noised_preview_{i}.jpg'), mode='pil') # noised_
         mask_inpaint = kiui.read_image(os.path.join(work_space, f'{asset}/inpaint_mask_{i}.png'), mode='pil')
         
-        inpainted_seg = pipe_inpainting(prompt=prompt, image=inpaint_img, mask_image=mask_inpaint, num_inference_steps=100).images[0]
+        inpainted_seg = pipe_inpainting(prompt=prompt, image=inpaint_img, mask_image=mask_inpaint, num_inference_steps=20, eta=0.0).images[0]
         inpainted_seg.save(f"./layout2image/{asset}/inpainted_instance_{i}.png")
         # rmbg
         inpainted_seg_ = kiui.read_image(f"./layout2image/{asset}/inpainted_instance_{i}.png", mode='uint8')
